@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "WS_PORT=3777 DB_FILE=./data/test.db node test/e2e.test.js"
+    "test": "WS_PORT=3777 WS_PING_MS=300 DB_FILE=./data/test.db node test/e2e.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

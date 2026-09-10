@@ -2,8 +2,9 @@
 
 /* ================= 常量与状态 ================= */
 
-const HEARTBEAT_MS = 8000; // 编辑期间每 8s 续租
-const IDELE_RELEASE_MS = 30_000; // 本地 30s 无操作主动释放锁
+const HEARTBEAT_MS = 8000;      // 编辑期间续租锁
+const APP_KEEPALIVE_MS = 20000; // 非编辑期连接保活（防止代理因空闲掐断）
+const IDLE_RELEASE_MS = 30_000; // 编辑中 30s 无输入：只交锁，不退编辑、不掉线
 const RECONNECT_DELAY = 1200;
 
 const state = {
@@ -18,10 +19,14 @@ const state = {
   locks: new Map(),         // nodeId -> { userId, userName, color }
   users: new Map(),         // userId -> user
   editingId: null,          // 当前正在编辑的 nodeId
+  hasLock: false,           // 当前编辑是否实际持有服务端锁（没锁也允许编辑/保存）
+  lockWanted: true,         // 是否希望持有锁（有输入时持续想要；空闲交锁后置 false）
   baseVersion: 0,           // 本次编辑基于的版本
+  serverVersion: 0,         // 编辑期间远端最新版本（用于提示"已有人改过，保存会合并"）
   restoreFromVersion: null, // 非 null 表示是"从历史版本回退后继续编辑"
   draft: '',
   orphanedDraft: null,      // 锁被 TTL 收走时暂存的草稿，重新编辑可恢复
+  saving: false,
   lastInputAt: 0,
   pendingConflict: null,    // 未解决的冲突上下文
   historyNodeId: null,
@@ -106,6 +111,7 @@ function connect(name) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   state.ws = ws;
+  state.userName = name;
   setConn('connecting');
 
   ws.addEventListener('open', () => {
@@ -127,8 +133,9 @@ function connect(name) {
   ws.addEventListener('close', () => {
     state.connected = false;
     setConn('offline');
-    // 断线时编辑状态全部失效；重连后用快照重建
-    state.editingId = null;
+    // 不丢弃编辑态与草稿：连接恢复后重新拿快照、重新申请锁即可继续。
+    // 服务端会因为本连接关闭自动释放该连接持有的锁（别人立刻能改）。
+    state.hasLock = false;
     state.locks.clear();
     renderUsers();
     renderOutline();
@@ -140,14 +147,22 @@ function connect(name) {
   ws.addEventListener('error', () => { /* close 会接管 */ });
 }
 
-function send(msg) {
+function send(msg, { quiet = false } = {}) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify(msg));
     return true;
   }
-  toast('连接已断开，正在重连…', 'error');
+  if (!quiet) toast('连接已断开，正在重连…（你的内容保留在编辑器里）', 'error');
   return false;
 }
+
+// 全局应用层保活：即使什么都不做，也定期发一个轻量心跳，
+// 避免反向代理/负载均衡因"连接空闲"把它掐掉（区别于服务端 ping 探活）。
+setInterval(() => {
+  if (state.connected && state.ws && state.ws.readyState === WebSocket.OPEN) {
+    send({ type: 'heartbeat' }, { quiet: true });
+  }
+}, APP_KEEPALIVE_MS);
 
 function setConn(status) {
   const dot = $('#conn-state');
@@ -170,22 +185,50 @@ function handleMessage(msg) {
       renderUsers();
       break;
     case 'locked':
+      // 别人（绝不会是自己，服务器不回发）拿到了某段锁
       state.locks.set(msg.nodeId, msg.user);
       patchNodeLock(msg.nodeId);
       break;
-    case 'unlocked':
-      state.locks.delete(msg.nodeId);
-      patchNodeLock(msg.nodeId);
-      // 自己手里的锁被 TTL 收走：草稿保留在内存，退出编辑态但提示可一键重开
+    case 'lock_acquired':
       if (state.editingId === msg.nodeId) {
-        state.orphanedDraft = { nodeId: msg.nodeId, text: state.draft };
-        stopEditing(msg.reason === 'ttl'
-          ? '编辑锁因长时间无操作被自动释放（草稿已保留，重新点编辑可继续）'
-          : '编辑锁已被释放（草稿已保留）');
+        state.hasLock = true;
+        state.lockWanted = true;
+        patchNodeLock(msg.nodeId);
+        if (msg.reacquired) toast('已重新占用该段落', 'ok', 1800);
       }
       break;
+    case 'unlocked': {
+      // 服务器不再把自己的解锁动作回发；这里收到的是"我持有的锁没了"
+      // （TTL 回收，或连接关闭后服务端清理）。不退编辑、不丢草稿：
+      // 占用干净消失，别人可以立刻改；我继续打字会自动重新占用。
+      const wasMine =
+        state.editingId === msg.nodeId && state.hasLock;
+      state.locks.delete(msg.nodeId);
+      if (wasMine) {
+        state.hasLock = false;
+        state.lockWanted = false;
+        patchNodeLock(msg.nodeId);
+        toast(
+          msg.reason === 'ttl'
+            ? '你有一阵没操作，占用已自动释放，别人现在可以改这段；继续输入会重新占用'
+            : '编辑占用已释放，继续输入会重新占用',
+          '', 4200,
+        );
+      } else {
+        patchNodeLock(msg.nodeId);
+      }
+      break;
+    }
     case 'lock_denied':
-      toast(`${msg.holder.userName} 正在编辑这一段`, 'error');
+      if (state.editingId === msg.nodeId) {
+        // 空闲交锁后别人接手了：允许继续编辑，但提示保存会走合并
+        state.hasLock = false;
+        state.lockWanted = false;
+        patchNodeLock(msg.nodeId);
+        toast(`${msg.holder.userName} 已在编辑这段，你仍可输入；保存时若冲突会让你确认`, '', 4200);
+      } else {
+        toast(`${msg.holder.userName} 正在编辑这一段`, 'error');
+      }
       break;
     case 'content':
       applyContent(msg);
@@ -199,12 +242,18 @@ function handleMessage(msg) {
         author: msg.revision.author,
         authorId: msg.revision.author_id,
         updatedAt: msg.revision.created_at,
-      });
+      }, { silent: true });
+      // 自己提交的合并保存成功（普通 save 的过期合并或回退保存）-> 结束编辑
+      if (state.saving && state.editingId === msg.nodeId) finishSave(msg.nodeId);
       break;
-    case 'saved':
-      // noop 保存（内容无变化）
+    case 'saved': {
+      // 自己保存成功（普通保存/noop/冲突裁决）
+      const rev = msg.revision;
+      finishSave(rev ? rev.node_id || msg.nodeId : msg.nodeId);
       break;
+    }
     case 'conflict':
+      state.saving = false;
       openConflict(msg);
       break;
     case 'history':
@@ -227,9 +276,12 @@ function handleMessage(msg) {
       // 服务器会紧接发 snapshot
       break;
     case 'heartbeat_ack':
-      // 正常续租；ok=false 说明锁已不属于自己
-      if (msg.ok === false && state.editingId === msg.nodeId) {
-        stopEditing('编辑锁已失效');
+      // 编辑锁续租失败：锁已不属于我（被 TTL 回收等），但不退出编辑
+      if (msg.ok === false && state.editingId === msg.nodeId && state.hasLock) {
+        state.hasLock = false;
+        state.lockWanted = false;
+        patchNodeLock(msg.nodeId);
+        toast('占用已自动释放，继续输入可重新占用；保存时会自动合并', '', 3600);
       }
       break;
     case 'error':
@@ -243,6 +295,7 @@ function handleMessage(msg) {
 function ingestSnapshot(msg) {
   state.title = msg.title;
   state.treeRev = msg.treeRev;
+  const editingId = state.editingId;
   state.nodes = new Map(msg.nodes.map((n) => [n.id, n]));
   state.locks = new Map((msg.locks || []).map((l) => [l.nodeId, l]));
   state.users = new Map((msg.users || []).map((u) => [u.userId, u]));
@@ -252,6 +305,19 @@ function ingestSnapshot(msg) {
   renderOutline();
   // 重连后若历史抽屉开着，刷新
   if (state.historyNodeId) send({ type: 'history', nodeId: state.historyNodeId });
+
+  if (editingId) {
+    if (!state.nodes.has(editingId)) {
+      stopEditing('正在编辑的段落已被删除');
+      return;
+    }
+    // 旧连接的锁随连接关闭已释放：重新占用（草稿、基准版本都保留）
+    state.hasLock = false;
+    state.lockWanted = true;
+    state.serverVersion = state.nodes.get(editingId).version;
+    send({ type: 'lock', nodeId: editingId });
+    patchNodeLock(editingId);
+  }
 }
 
 function indexChildren() {
@@ -276,20 +342,21 @@ function upsertNode(node) {
   indexChildren();
 }
 
-function applyContent(msg) {
+function applyContent(msg, { silent = false } = {}) {
   const node = state.nodes.get(msg.nodeId);
   if (!node) return; // 已删除或尚未收到
-  const wasEditing = state.editingId === msg.nodeId;
   node.version = msg.version;
   node.content = msg.content;
   node.author = msg.author;
   node.authorId = msg.authorId;
   node.updatedAt = msg.updatedAt;
-  if (wasEditing) {
-    // 自己保存的回执；他人内容不会在自己持锁时到达
-    state.baseVersion = msg.version;
-    renderOutline();
-    flashNode(msg.nodeId);
+
+  if (state.editingId === msg.nodeId) {
+    // 我没持锁期间别人改了这段：编辑器不动、草稿不丢；
+    // 只记录远端版本，保存时服务端按 baseVersion 做三方合并。
+    state.serverVersion = msg.version;
+    patchNodeLock(msg.nodeId);
+    if (!silent) toast('这段刚被别人更新过，你保存时会自动合并不冲突的部分', '', 3600);
   } else {
     patchNodeContent(msg.nodeId);
     flashNode(msg.nodeId);
@@ -375,8 +442,9 @@ function renderNode(id) {
 function renderNodeRow(node) {
   const isEditing = state.editingId === node.id;
   const lock = state.locks.get(node.id);
-  const lockedByMe = lock && state.me && lock.userId === state.me.userId;
-  const lockedByOther = lock && (!state.me || lock.userId !== state.me.userId);
+  const lockedByMe = !!lock && state.me && lock.userId === state.me.userId
+    || (isEditing && state.hasLock);
+  const lockedByOther = !!lock && (!state.me || lock.userId !== state.me.userId);
 
   const el = document.createElement('div');
   el.className = 'node';
@@ -478,29 +546,33 @@ function patchNodeLock(nodeId) {
 /* ================= 编辑器与锁 ================= */
 
 let heartbeatTimer = null;
-let idleTimer = null;
 
 function beginEdit(nodeId) {
   if (state.editingId) {
     toast('请先保存或取消当前编辑', 'error');
     return;
   }
+  const node = state.nodes.get(nodeId);
+  if (!node) return;
   const lock = state.locks.get(nodeId);
   if (lock && state.me && lock.userId !== state.me.userId) {
-    toast(`${lock.userName} 正在编辑这一段`, 'error');
+    toast(`${lock.userName} 正在编辑这一段，稍候再试`, 'error');
     return;
   }
-  // 先乐观进入编辑态，同时向服务器申请锁
   state.editingId = nodeId;
-  state.baseVersion = state.nodes.get(nodeId).version;
+  state.baseVersion = node.version;
+  state.serverVersion = node.version;
   state.restoreFromVersion = null;
-  // 恢复被 TTL 打断时暂存的草稿（基准仍是当前版本，保存时走三方合并）
+  state.hasLock = false;
+  state.lockWanted = true;
+  state.saving = false;
+  // 恢复之前未保存的草稿（例如锁被 TTL 收走后重新点进来）
   if (state.orphanedDraft && state.orphanedDraft.nodeId === nodeId) {
     state.draft = state.orphanedDraft.text;
     state.orphanedDraft = null;
     toast('已恢复你未保存的草稿，保存时会与服务器版本自动合并', 'ok', 3600);
   } else {
-    state.draft = state.nodes.get(nodeId).content || '';
+    state.draft = node.content || '';
   }
   state.lastInputAt = Date.now();
   renderOutline();
@@ -527,9 +599,15 @@ function renderEditor(node) {
   const ta = document.createElement('textarea');
   ta.value = state.editingId === node.id ? state.draft : node.content || '';
   ta.placeholder = '输入段落内容…';
+  if (state.saving) ta.disabled = true;
   ta.addEventListener('input', () => {
     state.draft = ta.value;
     state.lastInputAt = Date.now();
+    // 空闲自动交锁后再次输入：立刻重新占用
+    if (state.editingId === node.id && state.lockWanted && !state.hasLock) {
+      send({ type: 'lock', nodeId: node.id });
+    }
+    state.lockWanted = true;
   });
   ta.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -561,19 +639,27 @@ function renderEditor(node) {
   right.style.display = 'flex';
   right.style.gap = '8px';
   right.style.alignItems = 'center';
+
+  const lockLine = state.hasLock
+    ? '<span class="lock-state on">● 你正占用此段</span>'
+    : '<span class="lock-state off">○ 未占用（30 秒无输入会自动让出，继续输入即重新占用）</span>';
+  const behind = state.serverVersion > state.baseVersion
+    ? `<span class="lock-state warn">⚠ 期间已有 v${state.serverVersion}，保存将自动合并</span>` : '';
+  const baseLine = state.restoreFromVersion
+    ? `从历史 <b>v${state.restoreFromVersion}</b> 继续编辑`
+    : `基于 v${state.baseVersion}`;
   right.innerHTML =
-    `<span class="hint-inline"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 取消 · ` +
-    (state.restoreFromVersion
-      ? `从历史 <b>v${state.restoreFromVersion}</b> 继续编辑（保存时自动保留他人不冲突改动）`
-      : `基于 v${state.baseVersion}`) +
-    `</span>`;
+    `<span class="hint-inline">${lockLine} ${behind}<br>` +
+    `<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 取消 · ${baseLine}</span>`;
   const cancel = document.createElement('button');
   cancel.className = 'ghost';
   cancel.textContent = '取消';
+  cancel.disabled = state.saving;
   cancel.addEventListener('click', cancelEdit);
   const save = document.createElement('button');
   save.className = 'primary';
-  save.textContent = '保存';
+  save.textContent = state.saving ? '保存中…' : '保存';
+  save.disabled = state.saving;
   save.addEventListener('click', saveEdit);
   right.append(cancel, save);
   bar.appendChild(right);
@@ -596,40 +682,52 @@ function toolBtn(label, fn, danger = false) {
 
 function startLockTimers(nodeId) {
   clearInterval(heartbeatTimer);
-  clearTimeout(idleTimer);
   heartbeatTimer = setInterval(() => {
     if (state.editingId !== nodeId) return;
-    // 30s 无本地输入：主动交锁，避免"人开着页面去开会"一直占着
-    if (Date.now() - state.lastInputAt > IDELE_RELEASE_MS) {
-      toast('长时间未输入，已自动释放编辑锁', '');
+    const idleFor = Date.now() - state.lastInputAt;
+    if (idleFor > IDLE_RELEASE_MS && state.hasLock) {
+      // 30 秒无输入：只让出占用。编辑器保留、连接保留、草稿保留；
+      // 别人可以立刻编辑这段，我继续打字会自动重新占用。
+      state.hasLock = false;
+      state.lockWanted = false;
       send({ type: 'unlock', nodeId });
-      stopEditing('编辑锁因无操作已释放');
-      return;
+      patchNodeLock(nodeId);
+      toast('已空闲 30 秒，占用自动释放；继续输入可重新占用', '', 3600);
+    } else if (state.hasLock) {
+      send({ type: 'heartbeat', nodeId }, { quiet: true });
     }
-    send({ type: 'heartbeat', nodeId });
   }, HEARTBEAT_MS);
 }
 
-function stopEditing(reason) {
-  const id = state.editingId;
+function resetEditState() {
   state.editingId = null;
+  state.hasLock = false;
+  state.lockWanted = true;
   state.restoreFromVersion = null;
+  state.saving = false;
+  state.serverVersion = 0;
   clearInterval(heartbeatTimer);
-  clearTimeout(idleTimer);
+}
+
+function stopEditing(reason) {
+  resetEditState();
   updateEditingHint();
   renderOutline();
-  if (id && reason) toast(reason, reason.includes('失效') || reason.includes('释放') ? 'error' : '');
+  if (reason) toast(reason, 'error');
 }
 
 function cancelEdit() {
   const id = state.editingId;
-  if (id) send({ type: 'unlock', nodeId: id });
-  stopEditing();
+  if (!id) return;
+  if (state.hasLock) send({ type: 'unlock', nodeId: id });
+  resetEditState();
+  updateEditingHint();
+  renderOutline();
 }
 
 function saveEdit() {
   const nodeId = state.editingId;
-  if (!nodeId) return;
+  if (!nodeId || state.saving) return;
   const payload = state.restoreFromVersion
     ? {
         type: 'restore_save',
@@ -643,14 +741,26 @@ function saveEdit() {
         content: state.draft,
         baseVersion: state.baseVersion,
       };
-  const ok = send(payload);
-  if (!ok) return;
-  // 乐观结束编辑态；若冲突服务器会回 conflict -> openConflict 重新处理
-  send({ type: 'unlock', nodeId });
-  state.editingId = null;
-  state.restoreFromVersion = null;
-  clearInterval(heartbeatTimer);
-  clearTimeout(idleTimer);
+  // 不提前退出编辑、不提前解锁：等服务器确认。
+  // 成功走 saved/merge_notice -> finishSave；冲突走 conflict -> 弹窗（编辑器保留）。
+  const queued = send(payload);
+  if (!queued) {
+    toast('当前离线，内容保留在编辑器里，恢复连接后再保存', 'error');
+    return;
+  }
+  state.saving = true;
+  renderOutline();
+  focusEditor(nodeId);
+}
+
+// 保存成功后收尾（saved / merge_notice 都走这里）
+function finishSave(nodeId) {
+  if (!nodeId || state.editingId !== nodeId) {
+    state.saving = false;
+    return;
+  }
+  if (state.hasLock) send({ type: 'unlock', nodeId });
+  resetEditState();
   updateEditingHint();
   renderOutline();
 }
@@ -659,7 +769,7 @@ function updateEditingHint() {
   const hint = $('#editing-hint');
   if (state.editingId) {
     hint.classList.remove('hidden');
-    hint.textContent = '编辑中：修改会实时占用该段落，30 秒无操作自动释放';
+    hint.textContent = '编辑中：30 秒无操作自动让出占用（不会关闭编辑器或断开连接）';
   } else {
     hint.classList.add('hidden');
   }
@@ -786,10 +896,9 @@ function renderHistory(msg) {
   }
 }
 
-// 回退 = 把旧内容作为草稿载入编辑器。保存时 baseVersion 仍是当前版本，
-// 于是服务端会执行 merge3(当前服务器, 旧草稿, ...)：
-//   - 别人之后在别处的改动会自动保留（三方合并）；
-//   - 与旧内容重叠且与你"回退意图"冲突的，才弹冲突窗人工裁决。
+// 回退 = 把旧内容作为草稿载入编辑器。保存走 restore_save（diff4 语义）：
+//   - 回退点之后别人在别处的改动自动保留；
+//   - 正好改在你恢复区域的，才弹冲突窗人工裁决。
 function restoreRevision(nodeId, rev) {
   const node = state.nodes.get(nodeId);
   if (!node) {
@@ -809,8 +918,12 @@ function restoreRevision(nodeId, rev) {
 
   const wasNotEditing = state.editingId !== nodeId;
   state.editingId = nodeId;
-  state.baseVersion = node.version; // 展示用
-  state.restoreFromVersion = rev.version; // 保存时按 diff4 合并
+  state.baseVersion = node.version;
+  state.serverVersion = node.version;
+  state.restoreFromVersion = rev.version;
+  state.hasLock = false;
+  state.lockWanted = true;
+  state.saving = false;
   state.draft = rev.content;
   state.lastInputAt = Date.now();
   renderOutline();
@@ -821,8 +934,7 @@ function restoreRevision(nodeId, rev) {
   focusEditor(nodeId);
   updateEditingHint();
   toast(
-    `已载入 v${rev.version} 的内容作为草稿。保存时将与当前 v${node.version} 合并，` +
-    '其他人不冲突的改动会保留',
+    `已载入 v${rev.version} 的内容作为草稿。保存时将保留其他人之后不冲突的改动`,
     'ok',
     4200,
   );
@@ -848,28 +960,28 @@ $('#conflict-keep-remote').addEventListener('click', () => {
 $('#conflict-cancel').addEventListener('click', () => {
   $('#conflict-mask').classList.add('hidden');
   state.pendingConflict = null;
-  // 放弃本地草稿，退出编辑
-  stopEditing();
+  // 放弃本次提交：留在编辑器里（草稿不丢），恢复可编辑状态
+  state.saving = false;
+  renderOutline();
+  if (state.editingId) focusEditor(state.editingId);
 });
 $('#conflict-save').addEventListener('click', () => {
   const c = state.pendingConflict;
   if (!c) return;
   const final = $('#conflict-final').value;
-  send({
+  // resolve 的结果由服务器以 content 广播给别人、以 saved 回执给本人
+  const ok = send({
     type: 'resolve',
     nodeId: c.nodeId,
     content: final,
     keep: final === c.remote ? 'remote' : 'manual',
   });
+  if (!ok) return;
   $('#conflict-mask').classList.add('hidden');
   state.pendingConflict = null;
-  // 若锁还在则释放
+  state.saving = true;
+  // 收尾由 saved 消息驱动（finishSave）；这里先释放占用
   send({ type: 'unlock', nodeId: c.nodeId });
-  state.editingId = null;
-  clearInterval(heartbeatTimer);
-  clearTimeout(idleTimer);
-  updateEditingHint();
-  renderOutline();
   toast('已提交最终版本', 'ok');
 });
 

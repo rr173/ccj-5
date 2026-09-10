@@ -93,15 +93,22 @@ function handleHello(peer, msg) {
 
 function handleLock(peer, msg) {
   const nodeId = String(msg.nodeId || '');
+  const prev = locks.locks.get(nodeId);
   const held = locks.acquire(nodeId, peer.user, peer.connId);
   if (held) {
     send(peer, { type: 'lock_denied', nodeId, holder: sanitizeLock(held) });
-  } else {
+    return;
+  }
+  const reacquired = !!prev && prev.userId === peer.user.userId;
+  // 持有者本人：确认拿到锁
+  send(peer, { type: 'lock_acquired', nodeId, reacquired });
+  // 只有占用者发生变化时才需要通知别人；同一人重入不产生新占用事件
+  if (!reacquired) {
     broadcast({
       type: 'locked',
       nodeId,
       user: { userId: peer.user.userId, userName: peer.user.userName, color: peer.user.color },
-    });
+    }, peer.connId);
   }
 }
 
@@ -112,7 +119,8 @@ function sanitizeLock(lock) {
 function handleUnlock(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   if (locks.release(nodeId, peer.connId)) {
-    broadcast({ type: 'unlocked', nodeId });
+    // 不回发给释放者本人（他是动作发起方，本地已在管理编辑态）
+    broadcast({ type: 'unlocked', nodeId }, peer.connId);
   }
 }
 
@@ -441,12 +449,11 @@ function handleDelete(peer, msg) {
 
 wss.on('connection', (ws) => {
   const connId = crypto.randomUUID();
-  const peer = { connId, ws, user: null };
+  const peer = { connId, ws, user: null, alive: true };
   peers.set(connId, peer);
 
-  let alive = true;
   ws.on('pong', () => {
-    alive = true;
+    peer.alive = true;
   });
 
   ws.on('message', (raw) => {
@@ -493,27 +500,32 @@ wss.on('connection', (ws) => {
   });
 });
 
-// 死连接探测：ping 不回的连接终止（触发 close -> 释放锁）
+// 死连接探测：只负责清理真正死掉的 TCP 连接（浏览器/代理默认会回 pong，
+// 活着的页面即使完全不操作也不会被踢）。周期独立于编辑锁 TTL。
+const WS_PING_MS = Number(process.env.WS_PING_MS || 25000);
 const pingTimer = setInterval(() => {
-  for (const [connId, peer] of peers) {
+  for (const [, peer] of peers) {
     if (!peer.alive) {
-      peer.ws.terminate();
+      try { peer.ws.terminate(); } catch { /* ignore */ }
       continue;
     }
     peer.alive = false;
     try {
       peer.ws.ping();
     } catch {
-      peer.ws.terminate();
+      try { peer.ws.terminate(); } catch { /* ignore */ }
     }
   }
-}, LOCK_TTL);
+}, WS_PING_MS);
 pingTimer.unref?.();
 
-// TTL 扫描：回收静默锁并广播（持有者连接还在但长期无心跳，例如笔记本休眠）
+// TTL 扫描：回收"人还连着但编辑锁早该过期"的锁（页面挂后台/休眠）。
+// 连接保持不动，只让占用干净地消失，别人立刻能改这段。
 function sweepAndBroadcast() {
   const expired = locks.sweep();
-  for (const nodeId of expired) broadcast({ type: 'unlocked', nodeId, reason: 'ttl' });
+  for (const nodeId of expired) {
+    broadcast({ type: 'unlocked', nodeId, reason: 'ttl' });
+  }
   return expired;
 }
 const sweepTimer = setInterval(sweepAndBroadcast, 5000);

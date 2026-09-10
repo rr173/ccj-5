@@ -335,6 +335,51 @@ async function run() {
     assert.ok(!serverMod.locks.locks.has(node.id), '锁应已被回收');
   });
 
+  // ---------- 场景 9b：TTL 释放后别人立刻能接手，且不需要等连接关闭 ----------
+  await test('空闲锁被 TTL 回收后，其他用户可以立即获取同一段', async () => {
+    const snap = await latestSnapshot(a2);
+    const node = snap.nodes.find((n) => n.id !== globalThis.__target2);
+    a2.drain(() => true);
+    b2.drain(() => true);
+    a2.send({ type: 'lock', nodeId: node.id });
+    await b2.next((m) => m.type === 'locked' && m.nodeId === node.id);
+    // 拨老到过期并触发扫描：a2 的连接不断，只是锁没了
+    serverMod.locks.locks.get(node.id).at = Date.now() - 60_000;
+    const ttlA = a2.next((m) => m.type === 'unlocked' && m.nodeId === node.id && m.reason === 'ttl');
+    const ttlB = b2.next((m) => m.type === 'unlocked' && m.nodeId === node.id && m.reason === 'ttl');
+    serverMod.sweepAndBroadcast();
+    await Promise.all([ttlA, ttlB]);
+
+    // b2 立刻拿到锁；a2 再申请被拒绝
+    b2.send({ type: 'lock', nodeId: node.id });
+    const acquired = await b2.next((m) => m.type === 'lock_acquired' && m.nodeId === node.id);
+    assert.strictEqual(acquired.reacquired, false);
+    a2.send({ type: 'lock', nodeId: node.id });
+    const denied = await a2.next((m) => m.type === 'lock_denied' && m.nodeId === node.id);
+    assert.strictEqual(denied.holder.userId, 'u-bob2');
+    // a2 的连接依然活着（没有掉线）
+    assert.strictEqual(a2.ws.readyState, WebSocket.OPEN);
+    b2.send({ type: 'unlock', nodeId: node.id });
+  });
+
+  // ---------- 场景 9c：ping 探活 bug 回归 —— 完全空闲的活连接不能被掐 ----------
+  await test('连接挂着且完全不发消息，跨多个 ping 周期仍然存活（修复前每周期必死）', async () => {
+    const idle = await connect('发呆用户', 'u-idle');
+    await snapshotOf(idle);
+    assert.strictEqual(idle.ws.readyState, WebSocket.OPEN);
+    // 服务端 ping 周期由 WS_PING_MS 决定（测试里设短）；空等三轮，
+    // 浏览器/ws 库会自动回 pong，活连接必须保持 OPEN（修复前 peer.alive
+    // 从未被置位，第一轮就会被 terminate）。
+    const pingMs = Number(process.env.WS_PING_MS) || 25000;
+    await waitFor(pingMs * 3 + 200);
+    assert.strictEqual(idle.ws.readyState, WebSocket.OPEN, '空闲活连接不应被 terminate');
+    // 连接还能正常收发
+    idle.send({ type: 'history', nodeId: globalThis.__target2 });
+    const h = await idle.next((m) => m.type === 'history', 3000);
+    assert.ok(h.items.length > 0);
+    idle.close();
+  });
+
   a2.close();
   b2.close();
   bob.close();

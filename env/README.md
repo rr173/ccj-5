@@ -33,6 +33,7 @@ docker compose up -d --build
 | `PORT` | `3000` | HTTP/WS 监听端口 |
 | `DB_FILE` | `/data/app.db`（镜像内） | SQLite 文件路径 |
 | `LOCK_TTL_MS` | `30000` | 编辑锁无心跳多久后被服务器回收 |
+| `WS_PING_MS` | `25000` | 服务端 WebSocket ping 探活周期（只踢真正死掉的连接，空闲活连接不受影响） |
 
 不用 compose：
 
@@ -51,15 +52,16 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（14 个场景）
+npm test                  # WebSocket 端到端（16 个场景）
 node test/fraction.test.js        # 分数索引：6000 次随机插入顺序不变
 node test/merge.test.js           # diff3 固定用例
 node test/merge.property.test.js  # 4000 组随机编辑：交换律/无误报冲突
 ```
 
-端到端覆盖：初始快照、软锁拒绝、关页面立即解锁、版本保存广播、
+端到端覆盖：初始快照、软锁拒绝、关页面立即解锁、空闲 TTL 回收后他人立即接手、
+**空闲活连接跨多个 ping 周期不被掐**（回归）、版本保存广播、
 过期提交自动合并与收敛、真冲突拒绝与裁决收敛、历史留痕、
-回退 diff4 保留他人改动、TTL 回收、增/降级/删结构操作、过期树版本拒绝、
+回退 diff4 保留他人改动、增/降级/删结构操作、过期树版本拒绝、
 断线重连补齐离线期间修改。
 
 ---
@@ -106,12 +108,20 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 
 ### 占用状态生命周期
 
-1. 点「编辑」→ 客户端乐观进入编辑态 + 发 `lock`；他人收到 `locked`。
-2. 编辑期内每 8 秒发 `heartbeat` 续租；连续 30 秒没有键盘输入则本地主动交锁。
-3. 保存/取消 → `unlock`。
-4. 关闭/刷新页面：`beforeunload` 尽力发一次 `unlock`，WS `close` 兜底释放该连接全部锁。
-5. 崩溃/休眠/网络静默：服务器每 5 秒扫描 `at + TTL` 的锁并广播 `unlocked(reason=ttl)`；
-   另有 ws 协议层 ping/pong，死连接直接 terminate。
+关键语义：**没操作只会让出"占用"，不会断开连接、不会关闭编辑器、不会丢草稿。**
+
+1. 点「编辑」→ 向服务器申请锁；成功后他人段落上出现头像+"正在编辑"。
+2. 编辑期内每 8 秒发 `heartbeat` 续租。
+3. 连续 30 秒没有键盘输入：客户端**只发 unlock 让出占用**，编辑器原样保留；
+   别人立刻能改这段。你一旦继续输入，自动重新申请锁；若已被别人接手，
+   你仍可输入，保存时按版本号走三方合并（必要时弹冲突窗）。
+4. 服务器侧 TTL（默认 30 秒）是第二道保险：页面挂后台、定时器被浏览器节流等
+   情况下心跳停了，5 秒内被 sweep 回收并广播 `unlocked(reason=ttl)`。
+5. 保存/取消 → `unlock`。关闭/刷新页面：`beforeunload` 尽力发一次解锁，
+   WS `close` 兜底释放该连接全部锁。
+6. WebSocket ping 探活（默认 25 秒）**只终止真正死掉的 TCP 连接**；
+   此外客户端每 20 秒发一次应用层心跳，防止反向代理因"连接空闲"掐线。
+   因此开着页面发呆不会掉线。
 
 ### WebSocket 消息
 
@@ -136,7 +146,9 @@ delete {nodeId, treeRev}
 hello {user}
 snapshot {title, treeRev, nodes[], locks[], users[]}
 presence {users[]}
-locked {nodeId, user}            unlocked {nodeId, reason?}
+locked {nodeId, user}                  # 别人拿到锁（不会回发给持有者本人）
+lock_acquired {nodeId, reacquired}     # 你拿到/重新拿到锁
+unlocked {nodeId, reason?}             # 你持有的锁没了（TTL 等）；或别人的锁释放
 lock_denied {nodeId, holder}
 content {nodeId, version, content, author, ...}
 saved {nodeId, revision}
