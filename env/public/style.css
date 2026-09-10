@@ -94,6 +94,74 @@ button.danger { color: var(--danger); border-color: #f3c0c0; }
   padding: 3px 10px; border-radius: 999px;
 }
 
+/* 标签页：多份大纲 */
+.tabbar {
+  display: flex; align-items: stretch; gap: 6px;
+  padding: 8px 22px 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 51px; z-index: 19;
+  overflow-x: auto;
+}
+.doc-tabs { display: flex; align-items: stretch; gap: 4px; }
+.doc-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid var(--border); border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: #f1f3f6; color: var(--muted);
+  white-space: nowrap;
+}
+.doc-tab.active { background: var(--bg); color: var(--text); font-weight: 600; }
+.doc-tab-label { cursor: pointer; font-size: 14px; }
+.doc-tab-close {
+  border: none; background: transparent; padding: 0 4px;
+  color: var(--muted); font-size: 12px; border-radius: 4px;
+}
+.doc-tab-close:hover { background: #e3e6ea; color: var(--text); }
+.tab-new { margin-left: 8px; align-self: center; font-size: 13px; padding: 4px 10px; }
+
+/* 跟读段落 */
+.node.mirror-node { border-style: dashed; background: #fbfcff; }
+.mirror-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #3949ab;
+  background: #eef1fc; border-radius: 999px; padding: 1px 10px;
+}
+.mirror-tag-link { cursor: pointer; }
+.mirror-tag-link:hover { background: #dde3fa; }
+.mirror-edit-hint { color: #3949ab; }
+.node.source-gone { border-color: #e5b8b3; background: #fdf6f5; }
+.mirror-tombstone {
+  color: #9a3412; font-weight: 600;
+}
+.tombstone-mark { font-size: 15px; }
+.tombstone-sub {
+  font-weight: 400; font-size: 12px; color: var(--muted); margin-top: 2px;
+}
+button.danger-text { color: var(--danger); }
+.node.flash-source { animation: flash-source 2s ease; }
+@keyframes flash-source {
+  0% { box-shadow: 0 0 0 3px rgba(99, 102, 241, .4); }
+  100% { box-shadow: none; }
+}
+
+/* 新建大纲/挂跟读小弹窗 */
+.newdoc-card {
+  background: var(--panel); border-radius: var(--radius);
+  width: 480px; max-width: 100%;
+  padding: 22px; box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.newdoc-card h3 { margin: 0; }
+.newdoc-card input, .newdoc-card select {
+  font: inherit; padding: 9px 11px;
+  border: 1px solid var(--border); border-radius: 8px; width: 100%;
+}
+.newdoc-card input:focus, .newdoc-card select:focus {
+  outline: 2px solid #b7cdf7; border-color: var(--accent);
+}
+
 /* 大纲 */
 .main { max-width: 900px; margin: 0 auto; padding: 24px 18px 80px; }
 .outline-wrap { display: flex; flex-direction: column; gap: 6px; }

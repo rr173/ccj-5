@@ -30,6 +30,12 @@
       </div>
     </header>
 
+    <!-- 多份大纲的标签页 -->
+    <div class="tabbar">
+      <div id="doc-tabs" class="doc-tabs"></div>
+      <button id="new-doc-btn" class="ghost tab-new" title="再开一份大纲">＋ 新大纲</button>
+    </div>
+
     <main class="main">
       <div class="outline-wrap">
         <div id="outline"></div>
@@ -43,7 +49,7 @@
   <!-- 历史抽屉 -->
   <aside id="history-panel" class="history-panel hidden">
     <div class="history-head">
-      <strong>段落历史</strong>
+      <strong id="history-title">段落历史</strong>
       <button id="history-close" class="icon-btn" title="关闭">✕</button>
     </div>
     <div class="history-meta muted">
@@ -51,6 +57,37 @@
     </div>
     <div id="history-list" class="history-list"></div>
   </aside>
+
+  <!-- 新建大纲弹窗 -->
+  <div id="newdoc-mask" class="conflict-mask hidden">
+    <form id="newdoc-form" class="newdoc-card">
+      <h3>新建一份大纲</h3>
+      <p class="muted">每份大纲有自己的层级段落；段落可以作为「跟读」挂到别的大纲里，内容永远跟源同步。</p>
+      <input id="newdoc-title" maxlength="80" placeholder="大纲名称，例如：产品周会" autocomplete="off" required />
+      <div class="conflict-actions">
+        <button type="button" id="newdoc-cancel" class="ghost">取消</button>
+        <button type="submit" class="primary">创建并打开</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 挂跟读弹窗 -->
+  <div id="mirror-mask" class="conflict-mask hidden">
+    <div class="newdoc-card">
+      <h3>把这一段挂为跟读</h3>
+      <p class="muted">
+        选择另一份大纲，这一段会作为跟读挂到它的顶层。<b>正文只有源这一份</b>：
+        源改了所有跟读处同步变化；在跟读上直接改，等于改源，多人同时改仍走合并/冲突裁决。
+      </p>
+      <label class="final-label">挂到哪份大纲
+        <select id="mirror-doc-select"></select>
+      </label>
+      <div class="conflict-actions">
+        <button id="mirror-cancel" class="ghost">取消</button>
+        <button id="mirror-confirm" class="primary">挂过去并打开那份大纲</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 冲突解决弹窗 -->
   <div id="conflict-mask" class="conflict-mask hidden">

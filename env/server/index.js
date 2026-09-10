@@ -48,65 +48,161 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-// connId -> { ws, user: {userId, userName, color} }
+// connId -> { ws, user: {userId, userName, color}, rooms: Set<docId> }
 const peers = new Map();
-
-function broadcast(msg, exceptConnId = null) {
-  const data = JSON.stringify(msg);
-  for (const [connId, peer] of peers) {
-    if (connId === exceptConnId) continue;
-    if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data);
-  }
-}
 
 function send(peer, msg) {
   if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(JSON.stringify(msg));
 }
 
-function presenceList() {
-  return [...peers.values()].map((p) => p.user);
+function sendToDoc(docId, msg, exceptConnId = null) {
+  const data = JSON.stringify(msg);
+  for (const [connId, peer] of peers) {
+    if (connId === exceptConnId) continue;
+    if (!peer.rooms || !peer.rooms.has(docId)) continue;
+    if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data);
+  }
 }
 
-function snapshotMessage() {
-  const snap = store.getSnapshot(db, store.DEFAULT_DOC);
+function sendToDocs(docIds, msg, exceptConnId = null) {
+  for (const docId of new Set(docIds)) sendToDoc(docId, msg, exceptConnId);
+}
+
+function presenceList(docId) {
+  const out = [];
+  for (const peer of peers.values()) {
+    if (peer.rooms && peer.rooms.has(docId)) out.push(peer.user);
+  }
+  return out;
+}
+
+// 源节点变更（正文/锁）需要扇出到的全部文档：
+// 源所在文档 + 每一处挂载了该源跟读的宿主文档（跟读可能跨多份大纲）。
+function audienceDocIds(sourceIds) {
+  const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
+  const docs = new Set();
+  for (const id of ids) {
+    const node = store.getNode(db, id);
+    if (node) docs.add(node.doc_id);
+    for (const d of store.mirrorHostDocs(db, id)) docs.add(d);
+  }
+  return [...docs];
+}
+
+// 把行节点 id（可能是跟读 id）解析成源节点；返回 { source } 或 { error }
+function resolveEditable(nodeId) {
+  const row = store.getNode(db, nodeId);
+  if (!row || row.deleted) return { error: '该段落已被删除' };
+  if (row.mirror_of) {
+    const source = store.resolveSource(db, nodeId);
+    if (!source || source.deleted) return { error: '跟读的源段落已被删除' };
+    return { source, host: row };
+  }
+  return { source: row };
+}
+
+function snapshotMessage(docId) {
+  const snap = store.getSnapshot(db, docId);
   return {
     type: 'snapshot',
+    docId: snap.doc.id,
     title: snap.doc.title,
     treeRev: snap.doc.tree_rev,
     nodes: snap.nodes,
-    locks: locks.list(),
-    users: presenceList(),
+    locks: relevantLocks(docId, snap.nodes),
+    users: presenceList(docId),
   };
 }
 
-// ---------- 消息处理 ----------
+// 快照里只带本文档看得见的锁：源段落在本文档，或本文档挂着它的跟读
+function relevantLocks(docId, nodes) {
+  const sourceIds = new Set();
+  for (const n of nodes) {
+    if (n.kind === 'mirror') sourceIds.add(n.mirrorOf);
+    else sourceIds.add(n.id);
+  }
+  return locks.list().filter((l) => sourceIds.has(l.nodeId));
+}
+
+function docListMessage() {
+  return { type: 'doc_list', docs: store.listDocuments(db) };
+}
+
+// ---------- 文档房间 ----------
 
 function handleHello(peer, msg) {
   const userId = String(msg.userId || crypto.randomUUID());
   const userName = String(msg.userName || '匿名用户').slice(0, 40);
   peer.user = { userId, userName, color: colorFor(userId) };
+  peer.rooms = new Set();
   send(peer, { type: 'hello', user: peer.user });
-  send(peer, snapshotMessage());
-  // 通知其他人我来了（先注册再广播，presence 里包含自己）
-  broadcast({ type: 'presence', users: presenceList() }, peer.connId);
+  send(peer, docListMessage());
+
+  // 进入即打开默认大纲（保持单文档时代的交互/旧协议兼容）
+  joinDoc(peer, store.DEFAULT_DOC);
 }
+
+function joinDoc(peer, docId) {
+  const doc = store.getDoc(db, docId);
+  if (!doc) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  peer.rooms.add(docId);
+  send(peer, snapshotMessage(docId));
+  sendToDoc(docId, { type: 'presence', docId, users: presenceList(docId) }, peer.connId);
+}
+
+function handleOpenDoc(peer, msg) {
+  const docId = String(msg.docId || '');
+  if (!docId || !store.getDoc(db, docId)) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  if (!peer.rooms.has(docId)) joinDoc(peer, docId);
+  else send(peer, snapshotMessage(docId)); // 已订阅：仅刷新快照
+}
+
+function handleLeaveDoc(peer, msg) {
+  const docId = String(msg.docId || '');
+  if (peer.rooms.delete(docId)) {
+    sendToDoc(docId, { type: 'presence', docId, users: presenceList(docId) });
+  }
+}
+
+function handleCreateDoc(peer, msg) {
+  const title = String(msg.title || '').trim().slice(0, 80) || '未命名大纲';
+  const id = crypto.randomUUID();
+  store.createDocument(db, { id, title });
+  send(peer, { type: 'doc_created', doc: store.getDoc(db, id) });
+  // 所有在线端刷新大纲列表
+  for (const p of peers.values()) send(p, docListMessage());
+  joinDoc(peer, id);
+}
+
+// ---------- 锁（占用提示）。跟读上的编辑占用 = 源段落的锁 ----------
 
 function handleLock(peer, msg) {
   const nodeId = String(msg.nodeId || '');
-  const prev = locks.locks.get(nodeId);
-  const held = locks.acquire(nodeId, peer.user, peer.connId);
+  const resolved = resolveEditable(nodeId);
+  if (resolved.error) {
+    send(peer, { type: 'error', nodeId, message: resolved.error });
+    return;
+  }
+  const sourceId = resolved.source.id;
+  const prev = locks.locks.get(sourceId);
+  const held = locks.acquire(sourceId, peer.user, peer.connId);
   if (held) {
-    send(peer, { type: 'lock_denied', nodeId, holder: sanitizeLock(held) });
+    send(peer, { type: 'lock_denied', nodeId: sourceId, holder: sanitizeLock(held) });
     return;
   }
   const reacquired = !!prev && prev.userId === peer.user.userId;
-  // 持有者本人：确认拿到锁
-  send(peer, { type: 'lock_acquired', nodeId, reacquired });
-  // 只有占用者发生变化时才需要通知别人；同一人重入不产生新占用事件
+  send(peer, { type: 'lock_acquired', nodeId: sourceId, reacquired });
   if (!reacquired) {
-    broadcast({
+    // 源文档 + 所有挂了跟读的文档都要立刻看到"有人占用"
+    sendToDocs(audienceDocIds(sourceId), {
       type: 'locked',
-      nodeId,
+      nodeId: sourceId,
       user: { userId: peer.user.userId, userName: peer.user.userName, color: peer.user.color },
     }, peer.connId);
   }
@@ -118,9 +214,10 @@ function sanitizeLock(lock) {
 
 function handleUnlock(peer, msg) {
   const nodeId = String(msg.nodeId || '');
-  if (locks.release(nodeId, peer.connId)) {
-    // 不回发给释放者本人（他是动作发起方，本地已在管理编辑态）
-    broadcast({ type: 'unlocked', nodeId }, peer.connId);
+  const row = store.getNode(db, nodeId);
+  const sourceId = row && row.mirror_of ? store.resolveSource(db, nodeId)?.id : nodeId;
+  if (sourceId && locks.release(sourceId, peer.connId)) {
+    sendToDocs(audienceDocIds(sourceId), { type: 'unlocked', nodeId: sourceId }, peer.connId);
   }
 }
 
@@ -133,7 +230,11 @@ function handleHeartbeat(peer, msg) {
   }
 }
 
-// 保存段落内容：版本号乐观锁 + diff3 三方合并
+// ---------- 内容保存：版本号乐观锁 + diff3 三方合并 ----------
+// 无论编辑入口在源段落还是某个跟读，nodeId 永远是源节点 id
+// （跟读没有自己的正文），所以"两人在不同挂载点改同一段"就是
+// 现有协议里"两人改同一段"：合并/冲突裁决保证唯一收敛。
+
 function handleSave(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
@@ -144,7 +245,7 @@ function handleSave(peer, msg) {
   }
 
   const node = store.getNode(db, nodeId);
-  if (!node || node.deleted) {
+  if (!node || node.deleted || node.mirror_of) {
     send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
     return;
   }
@@ -160,7 +261,6 @@ function handleSave(peer, msg) {
       userName: peer.user.userName,
     });
     if (result.status === 'saved') {
-      // 保存者自己不需要回声（本地已切回只读态，且乐观版本一致）
       broadcastContent(nodeId, result.revision, peer.connId);
       send(peer, { type: 'saved', nodeId, revision: result.revision });
     } else if (result.status === 'noop') {
@@ -184,7 +284,6 @@ function handleSave(peer, msg) {
 
   const merged = merge3(base.content, content, latest.content);
   if (!merged.ok) {
-    // 真冲突：拒绝，返回三方原文，由用户在弹窗里裁决
     send(peer, {
       type: 'conflict',
       nodeId,
@@ -197,7 +296,6 @@ function handleSave(peer, msg) {
     return;
   }
 
-  // 自动合并成功：以最新版本为基准落库，note 标记合并来源
   const result = store.saveContent(db, {
     nodeId,
     content: merged.text,
@@ -208,7 +306,6 @@ function handleSave(peer, msg) {
   });
   if (result.status === 'saved') {
     broadcastContent(nodeId, result.revision, peer.connId);
-    // 保存者也需要知道这是合并结果（它的草稿可能还开着）
     send(peer, {
       type: 'merge_notice',
       nodeId,
@@ -221,9 +318,11 @@ function handleSave(peer, msg) {
 }
 
 function broadcastContent(nodeId, revision, exceptConnId = null) {
-  broadcast({
+  // 扇出到源文档与全部跟读宿主文档：同一份 revision，所有挂载点同步更新
+  sendToDocs(audienceDocIds(nodeId), {
     type: 'content',
     nodeId,
+    docId: store.getNode(db, nodeId).doc_id,
     version: revision.version,
     content: revision.content,
     author: revision.author,
@@ -233,14 +332,6 @@ function broadcastContent(nodeId, revision, exceptConnId = null) {
 }
 
 // 回退后继续编辑的保存（diff4 语义）。
-//   restoreVersion : 用户载入的旧版本号（共同祖先）
-//   content        : 以旧版本为起点编辑后的草稿
-//
-// 合并视角：base = 旧版本，A = 服务器当前（别人在旧版本之后的演进），
-// B = 用户草稿。于是：
-//   - 别人与回退草稿不相交的改动 -> 自动保留；
-//   - 同一块内容别人改了、草稿又恢复成旧样子 -> 冲突，交用户裁决；
-//   - 最终作为一个新版本落库，历史完整可追溯。
 function handleRestoreSave(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
@@ -251,7 +342,7 @@ function handleRestoreSave(peer, msg) {
   }
 
   const node = store.getNode(db, nodeId);
-  if (!node || node.deleted) {
+  if (!node || node.deleted || node.mirror_of) {
     send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
     return;
   }
@@ -265,7 +356,6 @@ function handleRestoreSave(peer, msg) {
     return;
   }
 
-  // 已经有人把文档推进到更新版本：做三方合并
   let finalText = content;
   if (latest.version !== restoreVersion) {
     const merged = merge3(baseRev.content, latest.content, content);
@@ -318,6 +408,11 @@ function handleHistory(peer, msg) {
 function handleResolve(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
+  const node = store.getNode(db, nodeId);
+  if (!node || node.deleted || node.mirror_of) {
+    send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
+    return;
+  }
   const latest = store.getLatestRevision(db, nodeId);
   const result = store.saveContent(db, {
     nodeId,
@@ -333,46 +428,121 @@ function handleResolve(peer, msg) {
   } else send(peer, { type: 'error', nodeId, message: '保存失败，请重试' });
 }
 
-// ---------- 结构操作（增/删/移动层级）----------
+// ---------- 结构操作（增/删/移动层级 / 挂跟读）----------
 
+// 新增普通段落。文档归属规则：
+//   指定了 parentId -> 与父级同文档（禁止跨文档父级）；
+//   顶层新增 -> msg.docId（缺省为默认文档）。
 function handleAdd(peer, msg) {
   const parentId = msg.parentId ? String(msg.parentId) : null;
   const afterId = msg.afterId ? String(msg.afterId) : null;
-  const newId = crypto.randomUUID();
-
-  const result = store.getDoc(db, store.DEFAULT_DOC);
-  // 客户端传 treeRev 做乐观锁
-  if (Number(msg.treeRev) !== result.tree_rev) {
-    send(peer, { type: 'tree_stale', treeRev: result.tree_rev });
-    send(peer, snapshotMessage());
+  let docId;
+  if (parentId) {
+    const parent = store.getNode(db, parentId);
+    if (!parent || parent.deleted) {
+      send(peer, { type: 'error', message: '父级段落不存在' });
+      return;
+    }
+    if (parent.mirror_of) {
+      send(peer, { type: 'error', message: '跟读段落下不能再加子级' });
+      return;
+    }
+    docId = parent.doc_id;
+  } else {
+    docId = String(msg.docId || store.DEFAULT_DOC);
+  }
+  const doc = store.getDoc(db, docId);
+  if (!doc) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  if (Number(msg.treeRev) !== doc.tree_rev) {
+    sendStale(peer, doc);
     return;
   }
 
-  // 计算新 pos：同级 afterId 之后（afterId 为空则插到开头）
-  const pos = computePosAfter(db, parentId, afterId);
+  const pos = computePosAfter(db, docId, parentId, afterId);
+  const newId = crypto.randomUUID();
   const added = store.addNode(db, {
     id: newId,
-    docId: store.DEFAULT_DOC,
+    docId,
     parentId,
     pos,
     content: String(msg.content || '').slice(0, 100_000) || '新段落',
     userId: peer.user.userId,
     userName: peer.user.userName,
   });
-  broadcast({
+  sendToDoc(docId, {
     type: 'node_added',
+    docId,
     node: added.node,
     treeRev: added.treeRev,
     by: peer.user.userId,
   });
 }
 
-function computePosAfter(dbx, parentId, afterId) {
+// 把源段落当作跟读挂进另一份大纲（也允许挂同份大纲的别处，但禁止形成链）
+function handleAddMirror(peer, msg) {
+  const sourceId = String(msg.sourceId || '');
+  const hostDocId = String(msg.docId || '');
+  const parentId = msg.parentId ? String(msg.parentId) : null;
+  const afterId = msg.afterId ? String(msg.afterId || '') : null;
+
+  const source = store.getNode(db, sourceId);
+  if (!source || source.deleted || source.mirror_of) {
+    send(peer, { type: 'error', message: '源段落不存在或已删除' });
+    return;
+  }
+  const hostDoc = store.getDoc(db, hostDocId);
+  if (!hostDoc) {
+    send(peer, { type: 'error', message: '目标大纲不存在' });
+    return;
+  }
+  if (Number(msg.treeRev) !== hostDoc.tree_rev) {
+    sendStale(peer, hostDoc);
+    return;
+  }
+  if (parentId) {
+    const parent = store.getNode(db, parentId);
+    if (!parent || parent.deleted || parent.doc_id !== hostDocId) {
+      send(peer, { type: 'error', message: '挂载位置无效' });
+      return;
+    }
+    if (parent.mirror_of) {
+      send(peer, { type: 'error', message: '跟读段落下不能再挂跟读' });
+      return;
+    }
+  }
+
+  const pos = computePosAfter(db, hostDocId, parentId, afterId);
+  const newId = crypto.randomUUID();
+  const added = store.addMirrorNode(db, {
+    id: newId,
+    docId: hostDocId,
+    parentId,
+    pos,
+    mirrorOf: sourceId,
+  });
+  sendToDoc(hostDocId, {
+    type: 'mirror_added',
+    docId: hostDocId,
+    node: added.node,
+    treeRev: added.treeRev,
+    by: peer.user.userId,
+  });
+}
+
+function sendStale(peer, doc) {
+  send(peer, { type: 'tree_stale', docId: doc.id, treeRev: doc.tree_rev });
+  send(peer, snapshotMessage(doc.id));
+}
+
+function computePosAfter(dbx, docId, parentId, afterId) {
   const siblings = dbx
     .prepare(
       'SELECT id, pos FROM nodes WHERE doc_id = ? AND deleted = 0 AND parent_id IS ? ORDER BY pos',
     )
-    .all(store.DEFAULT_DOC, parentId);
+    .all(docId, parentId);
   const idx = afterId ? siblings.findIndex((s) => s.id === afterId) : -1;
   const prev = idx >= 0 ? siblings[idx].pos : null;
   const next = idx + 1 < siblings.length ? siblings[idx + 1].pos : null;
@@ -385,28 +555,46 @@ function handleMove(peer, msg) {
   const afterId = msg.afterId ? String(msg.afterId || '') : null;
   const treeRev = Number(msg.treeRev);
 
+  const node = store.getNode(db, nodeId);
+  if (!node || node.deleted) return;
+  const doc = store.getDoc(db, node.doc_id);
+  if (treeRev !== doc.tree_rev) {
+    sendStale(peer, doc);
+    return;
+  }
   if (parentId === nodeId || isDescendant(db, nodeId, parentId)) {
     send(peer, { type: 'error', nodeId, message: '不能把段落移动到自己的子级里' });
     return;
   }
-  const pos = computePosForMove(db, parentId, afterId, nodeId);
+  if (parentId) {
+    const target = store.getNode(db, parentId);
+    if (!target || target.deleted || target.doc_id !== doc.id) {
+      send(peer, { type: 'error', nodeId, message: '移动目标不在同一份大纲里' });
+      return;
+    }
+    if (target.mirror_of) {
+      send(peer, { type: 'error', nodeId, message: '跟读段落下不能挂子级' });
+      return;
+    }
+  }
+  const pos = computePosForMove(db, doc.id, parentId, afterId, nodeId);
   const result = store.moveNode(db, { nodeId, parentId, pos, treeRev });
   if (result.status === 'stale') {
-    send(peer, { type: 'tree_stale', treeRev: result.treeRev });
-    send(peer, snapshotMessage());
+    sendStale(peer, doc);
     return;
   }
-  if (result.status === 'missing') return;
-  broadcast({ type: 'node_moved', nodeId, parentId, pos, treeRev: result.treeRev });
+  if (result.status !== 'moved') return;
+  sendToDoc(doc.id, {
+    type: 'node_moved', docId: doc.id, nodeId, parentId, pos, treeRev: result.treeRev,
+  });
 }
 
-// 移动时算位置，需排除被移动节点自身
-function computePosForMove(dbx, parentId, afterId, movingId) {
+function computePosForMove(dbx, docId, parentId, afterId, movingId) {
   const siblings = dbx
     .prepare(
       'SELECT id, pos FROM nodes WHERE doc_id = ? AND deleted = 0 AND parent_id IS ? ORDER BY pos',
     )
-    .all(store.DEFAULT_DOC, parentId)
+    .all(docId, parentId)
     .filter((s) => s.id !== movingId);
   const idx = afterId ? siblings.findIndex((s) => s.id === afterId) : -1;
   const prev = idx >= 0 ? siblings[idx].pos : null;
@@ -428,28 +616,55 @@ function isDescendant(dbx, ancestorId, maybeDescendantId) {
 
 function handleDelete(peer, msg) {
   const nodeId = String(msg.nodeId || '');
-  const result = store.deleteNode(db, { nodeId, treeRev: Number(msg.treeRev) });
-  if (result.status === 'stale') {
-    send(peer, { type: 'tree_stale', treeRev: result.treeRev });
-    send(peer, snapshotMessage());
+  const row = store.getNode(db, nodeId);
+  if (!row || row.deleted) return;
+  const doc = store.getDoc(db, row.doc_id);
+  if (Number(msg.treeRev) !== doc.tree_rev) {
+    sendStale(peer, doc);
     return;
   }
+
+  // 跟读行：只摘掉这一处挂载，源段落与别处跟读都不受影响
+  if (row.mirror_of) {
+    const result = store.deleteNode(db, { nodeId, treeRev: Number(msg.treeRev) });
+    if (result.status !== 'deleted') return;
+    sendToDoc(doc.id, {
+      type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
+    });
+    return;
+  }
+
+  const result = store.deleteNode(db, { nodeId, treeRev: Number(msg.treeRev) });
   if (result.status !== 'deleted') return;
-  // 释放被删除节点及其子树上的所有编辑锁
+
+  // 释放被删子树上所有编辑锁（锁以源 id 为键），并通知各房间
   for (const id of result.ids) {
     const lock = locks.locks.get(id);
     if (lock) {
       locks.release(id, lock.connId);
+      sendToDocs(audienceDocIds(id), { type: 'unlocked', nodeId: id, reason: 'deleted' });
     }
   }
-  broadcast({ type: 'nodes_deleted', ids: result.ids, treeRev: result.treeRev });
+
+  // 源文档：节点从树里消失
+  sendToDoc(doc.id, {
+    type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
+  });
+
+  // 挂在别的大纲（含同一份大纲别处）里的跟读：不删行、不显示旧正文，
+  // 转为"源已删除"墓碑。源行本身已由上面的 nodes_deleted 移除，
+  // source_deleted 只作用于 mirrorOf 匹配的镜像行，两者互不重叠。
+  const hostDocs = store.mirrorHostDocs(db, result.ids);
+  for (const hostDocId of hostDocs) {
+    sendToDoc(hostDocId, { type: 'source_deleted', sourceIds: result.ids });
+  }
 }
 
 // ---------- WebSocket 生命周期 ----------
 
 wss.on('connection', (ws) => {
   const connId = crypto.randomUUID();
-  const peer = { connId, ws, user: null, alive: true };
+  const peer = { connId, ws, user: null, rooms: new Set(), alive: true };
   peers.set(connId, peer);
 
   ws.on('pong', () => {
@@ -470,6 +685,10 @@ wss.on('connection', (ws) => {
     try {
       switch (msg.type) {
         case 'hello': handleHello(peer, msg); break;
+        case 'open_doc': handleOpenDoc(peer, msg); break;
+        case 'leave_doc': handleLeaveDoc(peer, msg); break;
+        case 'create_doc': handleCreateDoc(peer, msg); break;
+        case 'add_mirror': handleAddMirror(peer, msg); break;
         case 'lock': handleLock(peer, msg); break;
         case 'unlock': handleUnlock(peer, msg); break;
         case 'heartbeat': handleHeartbeat(peer, msg); break;
@@ -490,9 +709,16 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     peers.delete(connId);
+    // 锁释放要扇出到源文档 + 跟读宿主文档（两边占用同时消失）
     const released = locks.releaseAll(connId);
-    for (const nodeId of released) broadcast({ type: 'unlocked', nodeId });
-    broadcast({ type: 'presence', users: presenceList() });
+    for (const nodeId of released) {
+      sendToDocs(audienceDocIds(nodeId), { type: 'unlocked', nodeId });
+    }
+    // 离开每个文档房间，更新各房间在线名单
+    for (const docId of [...peer.rooms]) {
+      peer.rooms.delete(docId);
+      sendToDoc(docId, { type: 'presence', docId, users: presenceList(docId) });
+    }
   });
 
   ws.on('error', () => {
@@ -500,8 +726,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// 死连接探测：只负责清理真正死掉的 TCP 连接（浏览器/代理默认会回 pong，
-// 活着的页面即使完全不操作也不会被踢）。周期独立于编辑锁 TTL。
+// 死连接探测
 const WS_PING_MS = Number(process.env.WS_PING_MS || 25000);
 const pingTimer = setInterval(() => {
   for (const [, peer] of peers) {
@@ -519,12 +744,12 @@ const pingTimer = setInterval(() => {
 }, WS_PING_MS);
 pingTimer.unref?.();
 
-// TTL 扫描：回收"人还连着但编辑锁早该过期"的锁（页面挂后台/休眠）。
-// 连接保持不动，只让占用干净地消失，别人立刻能改这段。
+// TTL 扫描：回收"人还连着但编辑锁早该过期"的锁。
+// 扇出到源文档 + 跟读宿主文档：两边占用都自己消失。
 function sweepAndBroadcast() {
   const expired = locks.sweep();
   for (const nodeId of expired) {
-    broadcast({ type: 'unlocked', nodeId, reason: 'ttl' });
+    sendToDocs(audienceDocIds(nodeId), { type: 'unlocked', nodeId, reason: 'ttl' });
   }
   return expired;
 }

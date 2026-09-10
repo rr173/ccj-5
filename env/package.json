@@ -6,7 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "WS_PORT=3777 WS_PING_MS=300 DB_FILE=./data/test.db node test/e2e.test.js"
+    "test": "npm run test:e2e && npm run test:mirror && npm run test:unit",
+    "test:e2e": "WS_PORT=3777 WS_PING_MS=300 DB_FILE=./data/test.db node test/e2e.test.js",
+    "test:mirror": "WS_PORT=3778 WS_PING_MS=300 DB_FILE=./data/mirror.db node test/mirror.e2e.test.js",
+    "test:unit": "node test/fraction.test.js && node test/merge.test.js && node test/merge.property.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
