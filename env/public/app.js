@@ -236,7 +236,10 @@ function connect(name) {
     setConn('offline');
     // 锁随旧连接在服务端释放；编辑会话与草稿保留，重连后重新占用
     edit.hasLock = false;
-    for (const v of state.views.values()) v.locks.clear();
+    for (const v of state.views.values()) {
+      v.locks.clear();
+      v.lockInfo?.clear(); // 持有者信息一起清，否则断线窗口期徽章残留
+    }
     renderActiveDoc();
     setTimeout(() => {
       if (!state.connected) connect(userNameForReconnect);
@@ -900,7 +903,16 @@ function actionBtn(label, onClick, danger = false) {
 /* 局部补丁：源段落变了，把所有挂载点（源行 + 跟读行）的 DOM 换掉 */
 function patchSource(sourceId) {
   for (const { view, node } of rowsOfSource(sourceId)) patchRow(view, node.id);
+  // 编辑器正开在这段上：占用/版本提示也要跟着锁消息变（跟读入口同样生效），
+  // 不能等下次点编辑才对上号
+  if (edit.sourceId === sourceId) patchEditorStatus();
   updateEditingHint();
+}
+
+// 只刷新编辑器里的状态行，textarea 不动（patchRow 会跳过编辑入口行）
+function patchEditorStatus() {
+  const el = document.querySelector('.node-edit .edit-status');
+  if (el) el.innerHTML = editorStatusHtml();
 }
 
 function patchRow(view, nodeId) {
@@ -1070,17 +1082,7 @@ function renderEditor(node) {
   right.style.gap = '8px';
   right.style.alignItems = 'center';
 
-  const lockLine = edit.hasLock
-    ? '<span class="lock-state on">● 你正占用此段</span>'
-    : '<span class="lock-state off">○ 未占用（30 秒无输入会自动让出，继续输入即重新占用）</span>';
-  const behind = edit.serverVersion > edit.baseVersion
-    ? `<span class="lock-state warn">⚠ 期间已有 v${edit.serverVersion}，保存将自动合并</span>` : '';
-  const baseLine = edit.restoreFromVersion
-    ? `从历史 <b>v${edit.restoreFromVersion}</b> 继续编辑`
-    : `基于 v${edit.baseVersion}`;
-  right.innerHTML =
-    `<span class="hint-inline">${lockLine} ${behind}<br>` +
-    `<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 取消 · ${baseLine}</span>`;
+  right.innerHTML = `<span class="hint-inline edit-status">${editorStatusHtml()}</span>`;
   const cancel = document.createElement('button');
   cancel.className = 'ghost';
   cancel.textContent = '取消';
@@ -1096,6 +1098,21 @@ function renderEditor(node) {
 
   box.appendChild(bar);
   return box;
+}
+
+// 编辑器工具栏左侧的状态行：占用状态 + 落后版本提醒 + 快捷键/基准版本。
+// 锁消息到达时会用它原地刷新（不重绘 textarea，输入不被打断）。
+function editorStatusHtml() {
+  const lockLine = edit.hasLock
+    ? '<span class="lock-state on">● 你正占用此段</span>'
+    : '<span class="lock-state off">○ 未占用（30 秒无输入会自动让出，继续输入即重新占用）</span>';
+  const behind = edit.serverVersion > edit.baseVersion
+    ? `<span class="lock-state warn">⚠ 期间已有 v${edit.serverVersion}，保存将自动合并</span>` : '';
+  const baseLine = edit.restoreFromVersion
+    ? `从历史 <b>v${edit.restoreFromVersion}</b> 继续编辑`
+    : `基于 v${edit.baseVersion}`;
+  return `${lockLine} ${behind}<br>` +
+    `<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 保存 · <kbd>Esc</kbd> 取消 · ${baseLine}`;
 }
 
 function toolBtn(label, fn, danger = false) {
