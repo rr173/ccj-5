@@ -39,10 +39,16 @@ const OFFLINE_QUEUE_KEY = 'outline.offlineQueue.v1';
 const DRAFTS_KEY = 'outline.drafts.v1';
 
 // op: { id, nodeId, content, baseVersion, restoreFromVersion, queuedAt,
-//       status: 'pending' | 'conflict', conflict?: { base, local, remote, current } }
+//       status: 'pending' | 'conflict', conflict?: { base, local, remote, current },
+//       inEditor?: true }   —— inEditor 是运行时标记：正折在编辑器里，
+//       刷新/重开页面后一律视为待同步（编辑会话已不存在）。
 const offlineQueue = (() => {
   const v = loadJson(OFFLINE_QUEUE_KEY, []);
-  return Array.isArray(v) ? v.filter((o) => o && o.nodeId) : [];
+  if (!Array.isArray(v)) return [];
+  return v.filter((o) => o && o.nodeId).map((o) => {
+    delete o.inEditor;
+    return o;
+  });
 })();
 // sourceId -> { content, baseVersion, restoreFromVersion, at }
 const draftStore = (() => {
@@ -114,6 +120,16 @@ function pendingOpFor(sourceId) {
   return offlineQueue.find((o) => o.nodeId === sourceId) || null;
 }
 
+// 编辑会话折进了队列里的离线改动：取消/被迫结束编辑时把它原样还给队列
+// （内容保持已存本机的那一版），等联网后照常与线上对齐。
+function releaseFoldedOp(sourceId) {
+  const op = pendingOpFor(sourceId);
+  if (op && op.inEditor) {
+    delete op.inEditor;
+    persistOfflineQueue();
+  }
+}
+
 function removeOp(op) {
   const idx = offlineQueue.indexOf(op);
   if (idx >= 0) offlineQueue.splice(idx, 1);
@@ -130,6 +146,7 @@ function enqueueOfflineSave() {
     existing.queuedAt = Date.now();
     existing.status = 'pending';
     delete existing.conflict;
+    delete existing.inEditor; // 本次编辑会话结束，回到待同步
   } else {
     offlineQueue.push({
       id: 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
@@ -158,16 +175,22 @@ function enqueueOfflineSave() {
 async function flushOfflineQueue({ includeConflicts = false } = {}) {
   if (offlineSync.flushing || !state.connected || !state.me) return;
   if (includeConflicts) {
-    for (const o of offlineQueue) if (o.status === 'conflict') o.status = 'pending';
+    for (const o of offlineQueue) {
+      if (o.status === 'conflict' && !o.inEditor) o.status = 'pending';
+    }
     persistOfflineQueue();
   }
-  if (!offlineQueue.some((o) => o.status === 'pending')) { renderSyncState(); return; }
+  if (!offlineQueue.some((o) => o.status === 'pending' && !o.inEditor)) {
+    renderSyncState();
+    return;
+  }
   offlineSync.flushing = true;
   let saved = 0, merged = 0, conflicts = 0, failed = 0;
   try {
     for (;;) {
       if (!state.connected) break;
-      const op = offlineQueue.find((o) => o.status === 'pending');
+      // 折在编辑器里的（inEditor）不动：它随编辑会话的保存/取消走
+      const op = offlineQueue.find((o) => o.status === 'pending' && !o.inEditor);
       if (!op) break;
       const outcome = await syncOneOp(op, { wantModal: false });
       if (outcome === 'saved') saved++;
@@ -283,6 +306,10 @@ function routeSyncMessage(msg) {
 function onSyncBadgeClick(op) {
   if (!state.connected) {
     toast('离线中：改动已存本机，恢复连接后自动对齐', '');
+    return;
+  }
+  if (op.inEditor) {
+    toast('这段正在编辑器里：保存即同步，取消则回到待同步队列', '');
     return;
   }
   if (offlineSync.flushing || offlineSync.current) {
@@ -1383,13 +1410,25 @@ function beginEdit(nodeId) {
   const queuedOp = pendingOpFor(sourceId);
   const orphan = orphanDrafts.get(sourceId);
   if (queuedOp && offlineSync.current?.op !== queuedOp) {
-    // 这段有断线时存进本机的改动：折进编辑器，保存即按原基准版本与线上对齐
-    edit.draft = queuedOp.content;
+    // 这段有断线时存进本机的改动：折进编辑器，但**不移出队列**（只打 inEditor
+    // 标记）——取消编辑要把它原样还给队列，在线保存成功才真正移除。
+    // 已存本机的改动绝不能因为"点开看一眼再取消"丢掉。
+    queuedOp.inEditor = true;
+    persistOfflineQueue();
     edit.baseVersion = queuedOp.baseVersion ?? edit.baseVersion;
     edit.restoreFromVersion = queuedOp.restoreFromVersion || null;
-    removeOp(queuedOp);
+    if (orphan) {
+      // 上次折进编辑器后又敲了字（没保存）就刷新/关页面：草稿更新，优先恢复
+      edit.draft = orphan.content;
+      edit.baseVersion = orphan.baseVersion ?? edit.baseVersion;
+      edit.restoreFromVersion = orphan.restoreFromVersion || null;
+      orphanDrafts.delete(sourceId);
+      toast('已恢复你未保存的草稿；本段还有一份待同步的离线改动', 'ok', 3600);
+    } else {
+      edit.draft = queuedOp.content;
+      toast('已载入你断线时改的内容；保存时会与线上自动合并，取消也不会丢', 'ok', 3600);
+    }
     rememberDraft();
-    toast('已载入你断线时改的内容；保存时会与线上自动合并', 'ok', 3600);
   } else if (orphan) {
     edit.draft = orphan.content;
     // 草稿基于的旧版本一并恢复：保存时三方合并的 base 才是真正的共同祖先
@@ -1568,6 +1607,7 @@ function resetEditState() {
 }
 
 function stopEditing(reason) {
+  releaseFoldedOp(edit.sourceId); // 折进编辑器的离线改动还给队列，不丢
   clearPersistedDraft(edit.sourceId);
   resetEditState();
   updateEditingHint();
@@ -1578,6 +1618,9 @@ function stopEditing(reason) {
 function cancelEdit() {
   if (!edit.sourceId) return;
   if (edit.hasLock) send({ type: 'unlock', nodeId: edit.sourceId });
+  // 已存本机的离线改动：取消编辑不丢，还给队列等联网对齐；
+  // 只在框里敲了一半、从没保存过的草稿：照旧清掉。
+  releaseFoldedOp(edit.sourceId);
   clearPersistedDraft(edit.sourceId);
   resetEditState();
   updateEditingHint();
@@ -1621,6 +1664,9 @@ function finishSave(sourceId) {
     return;
   }
   if (edit.hasLock) send({ type: 'unlock', nodeId: sourceId });
+  // 折进编辑器的离线改动已随这次保存上线：从队列移除（否则回放会再存一遍旧文）
+  const folded = pendingOpFor(sourceId);
+  if (folded && folded.inEditor) removeOp(folded);
   clearPersistedDraft(sourceId);
   resetEditState();
   updateEditingHint();

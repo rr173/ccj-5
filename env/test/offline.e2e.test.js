@@ -195,6 +195,65 @@ async function main() {
     '离线时增/删/移动被明确拦下并说明',
   );
 
+  // ---------- 回归：已存本机的离线改动，点开看一眼再取消，不能丢 ----------
+  // n3：离线保存进队列 → 再点编辑（折进编辑器）→ 又敲了半截 → Esc 取消。
+  // 期望：队列里仍是已存本机的那一版（不含取消前敲的半截），徽章还在。
+  await editAndSave('关掉页面', '【甲离线n3】关掉页面后占用自动释放');
+  const n3RowEl = rowByText('【甲离线n3】');
+  const n3Id = n3RowEl.dataset.nodeId;
+  assert(
+    queueOps().some((o) => o.nodeId === n3Id && o.content === '【甲离线n3】关掉页面后占用自动释放'),
+    'n3 的离线改动已存本机队列',
+  );
+  [...n3RowEl.querySelectorAll(':scope > .node .node-actions button')]
+    .find((b) => b.textContent === '编辑').click();
+  await sleep(150);
+  const taN3 = $('#outline textarea');
+  assert(taN3 && taN3.value === '【甲离线n3】关掉页面后占用自动释放', '再点编辑载入的是已存本机的离线文本');
+  taN3.value = taN3.value + '（取消前又敲的半截）';
+  taN3.dispatchEvent(new window.Event('input', { bubbles: true }));
+  taN3.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await sleep(600); // 越过草稿落盘节流（400ms）
+  const opN3AfterCancel = queueOps().find((o) => o.nodeId === n3Id);
+  assert(
+    opN3AfterCancel && opN3AfterCancel.content === '【甲离线n3】关掉页面后占用自动释放',
+    '取消编辑后，已存本机的离线改动原样回到队列（不丢）',
+  );
+  assert(
+    !opN3AfterCancel.content.includes('取消前又敲的半截'),
+    '取消前没保存的半截不进队列（该清就清）',
+  );
+  assert(
+    rowByText('【甲离线n3】') && rowByText('【甲离线n3】').querySelector(':scope > .node .sync-badge.pending'),
+    '取消后行仍显示离线文本并挂回待同步徽章',
+  );
+  const draftsAfterCancel = JSON.parse(window.localStorage.getItem('outline.drafts.v1') || '{}');
+  assert(
+    !Object.values(draftsAfterCancel).some((d) => d.content && d.content.includes('取消前又敲的半截')),
+    '取消后落盘草稿里也没有那半截',
+  );
+
+  // n4：只在框里敲了一半、从没保存就取消 —— 什么都不该留下
+  const n4RowEl = rowByText('本周计划');
+  [...n4RowEl.querySelectorAll(':scope > .node .node-actions button')]
+    .find((b) => b.textContent === '编辑').click();
+  await sleep(150);
+  const taN4 = $('#outline textarea');
+  taN4.value = '本周计划【从没保存的半截】';
+  taN4.dispatchEvent(new window.Event('input', { bubbles: true }));
+  taN4.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await sleep(700); // 越过草稿落盘节流
+  assert(
+    !queueOps().some((o) => (o.content || '').includes('从没保存的半截')),
+    '从没保存就取消的半截不进离线队列',
+  );
+  const draftsN4 = JSON.parse(window.localStorage.getItem('outline.drafts.v1') || '{}');
+  assert(
+    !Object.values(draftsN4).some((d) => d.content && d.content.includes('从没保存的半截')),
+    '从没保存就取消的半截不进落盘草稿',
+  );
+  assert(!rowContent(rowByText('本周计划')).includes('从没保存的半截'), 'n4 行仍显示线上原文');
+
   // ---------- 服务器恢复。乙（另一客户端）重连并抢先保存 ----------
   // 乙在断线期间也改了这两段（本地持有文本，重连后先提交）：
   //   n1 与甲撞在同一处（句尾同一点插入）→ 必须冲突；
@@ -232,6 +291,16 @@ async function main() {
   const n2MirrorMsg = await B.next((m) =>
     m.type === 'content' && m.nodeId === n2.id && m.content.includes('【甲离线句首】'));
   assert(n2MirrorMsg.content.includes('【乙离线句尾】'), '跟读宿主大纲也广播到同一份');
+
+  // n3：取消编辑没丢的那条离线改动，重连后照常与线上对齐
+  const n3SyncedRow = await waitFor(() => {
+    const row = rowByText('【甲离线n3】');
+    return row && !row.querySelector(':scope > .node .sync-badge') ? row : null;
+  }, 'n3 的离线改动重连后同步上线、徽章消失');
+  assert(n3SyncedRow, '取消编辑保留下来的离线改动重连后成功对齐');
+  const n3MsgB = await B.next((m) =>
+    m.type === 'content' && m.nodeId === n3.id && m.content.includes('【甲离线n3】'));
+  assert(n3MsgB, '乙也收到 n3 同步后的同一份');
 
   // 甲切到跟读宿主大纲：跟读行就是合并后的那一份
   $$('.doc-tab-label').find((t) => t.textContent.includes('跟读宿主')).click();
@@ -290,12 +359,15 @@ async function main() {
   assert(finalMsg.content === n1FinalA, '裁决后甲、乙两边逐字一致');
 
   // ---------- clientTag 透传 ----------
+  // 注意：n3 已被甲的离线回放推进到 v2，乙基于 v1 的保存会走三方合并，
+  // 回执是 merge_notice 而不是 saved —— 两者都必须透传 clientTag。
   B.send({
     type: 'save', nodeId: n3.id, content: n3.content + '【乙改】',
     baseVersion: n3.version, clientTag: 'tag-x',
   });
-  const tagged = await B.next((m) => m.type === 'saved' && m.nodeId === n3.id);
-  assert(tagged.clientTag === 'tag-x', '服务器在回执里透传 clientTag');
+  const tagged = await B.next((m) =>
+    m.nodeId === n3.id && (m.type === 'saved' || m.type === 'merge_notice'));
+  assert(tagged.clientTag === 'tag-x', `服务器在回执里透传 clientTag（${tagged.type}）`);
 
   // ---------- 未保存草稿随输入落盘，取消后清除 ----------
   await waitFor(() => rowByText('【乙改】'), '甲看到乙对 n3 的修改');
