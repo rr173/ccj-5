@@ -26,9 +26,16 @@
       </div>
       <div class="top-actions">
         <span id="editing-hint" class="editing-hint hidden"></span>
+        <button id="timeline-btn" class="ghost" title="按时刻回看整份大纲">🕘 时间轴</button>
         <div id="users" class="users"></div>
       </div>
     </header>
+
+    <!-- 回看模式横幅：整份大纲正处在某个过去时刻 -->
+    <div id="tt-banner" class="tt-banner hidden">
+      <span id="tt-banner-text"></span>
+      <button id="tt-exit" class="ghost">回到现在</button>
+    </div>
 
     <!-- 多份大纲的标签页 -->
     <div class="tabbar">
@@ -56,6 +63,18 @@
       <span id="history-current"></span>
     </div>
     <div id="history-list" class="history-list"></div>
+  </aside>
+
+  <!-- 整份时间轴抽屉：选一个时刻，整份大纲（含跟读投影）回到当时 -->
+  <aside id="timeline-panel" class="history-panel timeline-panel hidden">
+    <div class="history-head">
+      <strong>整份时间轴</strong>
+      <button id="timeline-close" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div class="history-meta muted">
+      <span>选一个过去的时刻，当前大纲的层级与正文整体回到当时；挂着跟读的大纲用同一时刻对照，所有人看到的完全一致。</span>
+    </div>
+    <div id="timeline-list" class="history-list"></div>
   </aside>
 
   <!-- 新建大纲弹窗 -->

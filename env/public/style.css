@@ -268,6 +268,41 @@ button.danger-text { color: var(--danger); }
 .rev-actions { margin-top: 8px; display: flex; gap: 6px; }
 .rev-actions button { font-size: 12px; padding: 3px 10px; }
 
+/* 整份时间轴 */
+.timeline-panel { width: 440px; }
+.tl-card { cursor: default; }
+.tl-card.current { border-color: var(--warn); background: #fffaf0; }
+.tl-kind {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  border-radius: 999px; padding: 0 8px; margin-right: 6px;
+  background: #eef1f5; color: var(--muted);
+}
+.tl-kind.add { background: #e8f7ef; color: #047857; }
+.tl-kind.content { background: #e8effd; color: #1d4ed8; }
+.tl-kind.move { background: #f3e8fd; color: #7c3aed; }
+.tl-kind.delete { background: #fdeaea; color: #b91c1c; }
+.tl-kind.mirror_add { background: #eef1fc; color: #3949ab; }
+.tl-doc { font-size: 11px; color: var(--muted); }
+
+/* 回看模式 */
+.tt-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 22px;
+  background: #fff7e8; border-bottom: 1px solid #f3dfb3;
+  color: #8a5a00; font-size: 13px;
+  position: sticky; top: 103px; z-index: 18;
+}
+.tt-banner button { flex: none; font-size: 12px; padding: 3px 12px; }
+.node.tt-node { background: #fffdf7; }
+.node.tt-node .node-content { color: #3f4654; }
+.node.tt-gone .node-content { color: var(--muted); }
+.tt-actions { display: flex; gap: 2px; }
+.tt-actions button { padding: 2px 8px; font-size: 12px; }
+.tt-gone-tag {
+  font-size: 11px; color: #9a3412; background: #fdeeea;
+  border-radius: 999px; padding: 1px 8px;
+}
+
 /* 冲突弹窗 */
 .conflict-mask {
   position: fixed; inset: 0; z-index: 50;

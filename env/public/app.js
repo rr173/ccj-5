@@ -39,6 +39,18 @@ const state = {
   pendingNewDocId: null, // create_doc 后等待快照自动打开的文档
 };
 
+// 整份时间轴回看。active 时当前标签页渲染"时刻 seq"的整棵树（层级+正文，只读），
+// 实时视图在后台照常接收更新，退出回看立即回到最新。
+// seq 是全局时刻坐标：源大纲与跟读宿主大纲用同一 seq 对照，看到的状态严格一致。
+const timeTravel = {
+  active: false,
+  seq: 0,
+  at: null,             // 该时刻的服务器时间戳（横幅显示用）
+  latestSeq: 0,
+  byDoc: new Map(),     // docId -> { nodes, children, title, asOf }，切标签页按同一 seq 对照
+};
+const timelineCache = { items: [], latestSeq: 0 };
+
 const $ = (sel) => document.querySelector(sel);
 
 /* ================= 工具 ================= */
@@ -204,6 +216,8 @@ function activateTab(docId) {
     if (!viewOf(docId)) requestDoc(docId);
     setHash({ docId });
   }
+  // 回看模式中切标签页：新文档也回到同一时刻，方便源/跟读两份对照
+  if (timeTravel.active) ensureTimeSnapshot(docId);
   renderTabs();
   renderActiveDoc();
 }
@@ -342,6 +356,15 @@ function handleMessage(msg) {
       break;
     case 'history':
       renderHistory(msg);
+      break;
+    case 'timeline':
+      timelineCache.items = msg.items || [];
+      timelineCache.latestSeq = msg.latestSeq || 0;
+      timeTravel.latestSeq = timelineCache.latestSeq;
+      drawTimeline();
+      break;
+    case 'snapshot_at':
+      ingestSnapshotAt(msg);
       break;
     case 'node_added':
       upsertNode(msg.docId, msg.node, msg.treeRev);
@@ -752,13 +775,18 @@ function renderActiveDoc() {
   $('#doc-title').textContent = view ? view.title : (doc ? doc.title : '协同大纲');
   renderUsers();
   renderOutline();
-  $('#add-root').disabled = !state.activeDocId;
+  renderTimeBanner();
+  $('#add-root').disabled = !state.activeDocId || timeTravel.active;
   updateEditingHint();
 }
 
 function renderOutline() {
   const root = $('#outline');
   root.innerHTML = '';
+  if (timeTravel.active) {
+    renderTimeTree(root);
+    return;
+  }
   const view = viewOf(state.activeDocId);
   if (!view) return;
   const roots = view.children.get(null) || [];
@@ -952,6 +980,10 @@ async function jumpToSource(node, { edit = false } = {}) {
 let heartbeatTimer = null;
 
 function beginEdit(nodeId) {
+  if (timeTravel.active) {
+    toast('回看模式里不能直接编辑；请用段落上的「从此刻继续编辑」另开一条线', 'error');
+    return;
+  }
   if (edit.sourceId) {
     toast('请先保存或取消当前编辑', 'error');
     return;
@@ -1442,7 +1474,7 @@ function renderHistory(msg) {
 function restoreRevision(nodeId, rev) {
   const found = findRow(nodeId);
   if (!found) {
-    toast('该段落已不存在', 'error');
+    toast('该段落在当前已不存在（可能已被删除），无法从旧时刻接着改', 'error');
     return;
   }
   if (edit.sourceId && edit.sourceId !== nodeId) {
@@ -1478,6 +1510,234 @@ function restoreRevision(nodeId, rev) {
   focusEditor(nodeId);
   updateEditingHint();
   toast('已载入旧版本内容作为草稿。保存时将保留其他人之后不冲突的改动', 'ok', 4200);
+}
+
+/* ================= 整份时间轴：按时刻回看 + 从该时刻另开一条线 ================= */
+
+$('#timeline-btn').addEventListener('click', () => {
+  $('#timeline-panel').classList.remove('hidden');
+  send({ type: 'timeline' });
+});
+$('#timeline-close').addEventListener('click', () => {
+  $('#timeline-panel').classList.add('hidden');
+});
+$('#tt-exit').addEventListener('click', exitTimeTravel);
+
+const TL_KIND_LABEL = { add: '新增', content: '修改', move: '移动', delete: '删除', mirror_add: '跟读' };
+
+function drawTimeline() {
+  const list = $('#timeline-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  const nowCard = document.createElement('div');
+  nowCard.className = 'rev-card tl-card' + (!timeTravel.active ? ' current' : '');
+  nowCard.innerHTML =
+    `<div class="rev-head"><span><strong>现在</strong> · 最新状态（时刻 #${timelineCache.latestSeq}）</span></div>` +
+    (timeTravel.active ? '<div class="rev-actions"><button class="tl-jump">回到现在</button></div>' : '');
+  if (timeTravel.active) {
+    nowCard.querySelector('.tl-jump').addEventListener('click', exitTimeTravel);
+  }
+  list.appendChild(nowCard);
+
+  for (const item of timelineCache.items) {
+    const card = document.createElement('div');
+    card.className = 'rev-card tl-card' +
+      (timeTravel.active && item.seq === timeTravel.seq ? ' current' : '');
+    card.innerHTML = `
+      <div class="rev-head">
+        <span><span class="tl-kind ${escapeHtml(item.kind)}">${escapeHtml(TL_KIND_LABEL[item.kind] || item.kind)}</span>
+        <strong>#${item.seq}</strong> · ${escapeHtml(item.author || '系统')}</span>
+        <span class="muted">${fmtTime(item.createdAt)}</span>
+      </div>
+      <div class="rev-content"></div>
+      <div class="tl-doc">${escapeHtml(item.docTitle || '')}</div>
+      ${item.note ? `<div class="rev-note">${escapeHtml(item.note)}</div>` : ''}
+      <div class="rev-actions"><button class="tl-jump">回到这一刻</button></div>`;
+    card.querySelector('.rev-content').textContent = item.summary || '';
+    card.querySelector('.tl-jump').addEventListener('click', () => enterTimeTravel(item.seq));
+    list.appendChild(card);
+  }
+}
+
+function enterTimeTravel(seq) {
+  if (edit.sourceId) {
+    toast('请先保存或取消当前编辑，再进入整份回看', 'error');
+    return;
+  }
+  timeTravel.active = true;
+  timeTravel.seq = seq;
+  timeTravel.byDoc.clear();
+  ensureTimeSnapshot(state.activeDocId);
+  renderActiveDoc();
+  drawTimeline();
+  toast(`已回到时刻 #${seq} 的整份大纲；切标签页可按同一时刻对照跟读的两份大纲`, 'ok', 3600);
+}
+
+function exitTimeTravel() {
+  if (!timeTravel.active) return;
+  timeTravel.active = false;
+  timeTravel.byDoc.clear();
+  renderActiveDoc();
+  drawTimeline();
+}
+
+function ensureTimeSnapshot(docId) {
+  if (!docId || timeTravel.byDoc.has(docId)) return;
+  send({ type: 'snapshot_at', docId, seq: timeTravel.seq });
+}
+
+function ingestSnapshotAt(msg) {
+  // 只接受当前时刻的响应（连点几个时刻时，过期响应直接丢弃）
+  if (!timeTravel.active || !msg.asOf || msg.asOf.seq !== timeTravel.seq) return;
+  const nodes = new Map(msg.nodes.map((n) => [n.id, n]));
+  const children = new Map();
+  for (const node of nodes.values()) {
+    const key = node.parentId ?? null;
+    if (!children.has(key)) children.set(key, []);
+    children.get(key).push(node.id);
+  }
+  for (const ids of children.values()) {
+    ids.sort((a, b) => {
+      const pa = nodes.get(a).pos || '';
+      const pb = nodes.get(b).pos || '';
+      return pa < pb ? -1 : pa > pb ? 1 : 0;
+    });
+  }
+  timeTravel.at = msg.asOf.createdAt;
+  timeTravel.latestSeq = msg.asOf.latestSeq || timeTravel.latestSeq;
+  timeTravel.byDoc.set(msg.docId, { nodes, children, title: msg.title, asOf: msg.asOf });
+  if (msg.docId === state.activeDocId) renderActiveDoc();
+}
+
+function renderTimeBanner() {
+  const banner = $('#tt-banner');
+  if (!timeTravel.active) {
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+  $('#tt-banner-text').textContent =
+    `正在回看时刻 #${timeTravel.seq}${timeTravel.at ? '（' + fmtTime(timeTravel.at) + '）' : ''} 的整份大纲：` +
+    '层级与正文只读。点段落上的「从此刻继续编辑」会另开一条线接着写，与现在的内容自动合并';
+}
+
+function renderTimeTree(root) {
+  const tt = timeTravel.byDoc.get(state.activeDocId);
+  if (!tt) {
+    const tip = document.createElement('div');
+    tip.className = 'muted';
+    tip.style.padding = '12px 4px';
+    tip.textContent = '正在重建这一时刻的整份大纲…';
+    root.appendChild(tip);
+    return;
+  }
+  const roots = tt.children.get(null) || [];
+  if (!roots.length) {
+    const tip = document.createElement('div');
+    tip.className = 'muted';
+    tip.style.padding = '12px 4px';
+    tip.textContent = '这一时刻这份大纲还是空的';
+    root.appendChild(tip);
+    return;
+  }
+  for (const id of roots) root.appendChild(renderTimeNode(tt, id));
+}
+
+function renderTimeNode(tt, id) {
+  const node = tt.nodes.get(id);
+  const wrap = document.createElement('div');
+  wrap.className = 'node-outer';
+  wrap.dataset.nodeId = id;
+  wrap.appendChild(renderTimeRow(node));
+  const kids = tt.children.get(id);
+  if (kids && kids.length) {
+    const childWrap = document.createElement('div');
+    childWrap.className = 'children';
+    for (const cid of kids) childWrap.appendChild(renderTimeNode(tt, cid));
+    wrap.appendChild(childWrap);
+  }
+  return wrap;
+}
+
+function renderTimeRow(node) {
+  const el = document.createElement('div');
+  el.className = 'node tt-node' + (node.kind === 'mirror' ? ' mirror-node' : '');
+  if (node.kind === 'mirror' && node.sourceDeleted) el.classList.add('source-gone');
+
+  const row = document.createElement('div');
+  row.className = 'node-row';
+
+  const content = document.createElement('div');
+  if (node.kind === 'mirror' && node.sourceDeleted) {
+    content.className = 'node-content mirror-tombstone';
+    content.innerHTML =
+      '<span class="tombstone-mark">🪦</span> 该时刻源段落不存在（尚未创建或已被删除）';
+  } else {
+    content.className = 'node-content' + (node.content ? '' : ' placeholder');
+    content.textContent = node.content || '（空段落）';
+  }
+  row.appendChild(content);
+
+  // 「接着改」的入口：普通行看自己当前是否还活着；跟读行看源当前是否还活着
+  const actions = document.createElement('div');
+  actions.className = 'tt-actions';
+  const goneNow = node.kind === 'mirror' ? !node.sourceAliveNow : !node.aliveNow;
+  if (node.kind === 'mirror' && node.sourceDeleted) {
+    // 当时源就不存在，无可接着改
+  } else if (goneNow) {
+    const tag = document.createElement('span');
+    tag.className = 'tt-gone-tag';
+    tag.textContent = node.kind === 'mirror' ? '源当前已删除' : '当前已删除';
+    actions.appendChild(tag);
+  } else {
+    actions.appendChild(actionBtn('从此刻继续编辑', () => continueFromPast(node)));
+  }
+  row.appendChild(actions);
+  el.appendChild(row);
+
+  const meta = document.createElement('div');
+  meta.className = 'node-meta';
+  if (node.kind === 'mirror') {
+    const tag = document.createElement('span');
+    tag.className = 'mirror-tag';
+    const srcDoc = node.sourceDocId ? state.docs.get(node.sourceDocId) : null;
+    tag.textContent = '🔗 跟读自：' + (srcDoc ? srcDoc.title : '另一份大纲');
+    meta.appendChild(tag);
+  }
+  const versionTag = document.createElement('span');
+  versionTag.className = 'version-tag';
+  versionTag.textContent = `当时 v${node.version ?? '—'}`;
+  meta.appendChild(versionTag);
+  if (node.author && !node.sourceDeleted) {
+    const tag = document.createElement('span');
+    tag.className = 'muted';
+    tag.textContent = `${node.author} · ${fmtTime(node.updatedAt)}`;
+    meta.appendChild(tag);
+  }
+  el.appendChild(meta);
+  return el;
+}
+
+// 从回看的这一刻接着改：退出回看，把该时刻的正文当草稿载入编辑器，
+// 保存走 restore_save（diff4 三方合并）——另开一条线，当前线上别人
+// 后来写下、不冲突的改动自动保留；真重叠仍会弹冲突窗裁决。
+async function continueFromPast(node) {
+  const sourceId = node.kind === 'mirror' ? node.mirrorOf : node.id;
+  const sourceDocId = node.kind === 'mirror' ? node.sourceDocId : state.activeDocId;
+  const rev = { version: node.version, content: node.content ?? '' };
+  exitTimeTravel();
+  $('#timeline-panel').classList.add('hidden');
+  if (sourceDocId && sourceDocId !== state.activeDocId) {
+    const ok = await ensureOpen(sourceDocId);
+    if (!ok) return;
+    activateTab(sourceDocId);
+  }
+  // 源文档快照可能还在路上（尤其从跟读行跳回源大纲），等它到了再进编辑器
+  for (let i = 0; i < 30 && !findRow(sourceId); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  restoreRevision(sourceId, rev);
 }
 
 /* ================= 冲突解决 ================= */

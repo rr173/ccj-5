@@ -33,7 +33,6 @@ function init(dbFile) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_nodes_doc ON nodes(doc_id, deleted);
-    CREATE INDEX IF NOT EXISTS idx_nodes_mirror ON nodes(mirror_of) WHERE mirror_of IS NOT NULL;
 
     -- 段落级 append-only 历史。当前内容 = 该 node 最新一条 revision。
     -- 跟读（mirror）节点自身没有 revision：它的内容是源节点 revision 的投影。
@@ -50,16 +49,89 @@ function init(dbFile) {
       UNIQUE(node_id, version)
     );
     CREATE INDEX IF NOT EXISTS idx_rev_node ON revisions(node_id, version);
+
+    -- 整份大纲的 append-only 时间轴：结构（增/移/删/挂跟读）与内容（每次保存）
+    -- 共用同一个全局单调 seq，seq 就是"时刻"坐标。任意 seq 可确定性重建
+    -- 当时整棵树的层级 + 正文（跟读投影源在同一 seq 的内容），所有人看到
+    -- 的必然是同一份重建结果。
+    CREATE TABLE IF NOT EXISTS timeline (
+      seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id      TEXT NOT NULL,      -- 事件归属文档（内容事件 = 源节点所在文档）
+      kind        TEXT NOT NULL,      -- add | mirror_add | move | delete | content
+      node_id     TEXT NOT NULL,      -- 主语节点（delete 时是删除起点）
+      parent_id   TEXT,               -- add/mirror_add/move：新父级
+      pos         TEXT,               -- add/mirror_add/move：新位置
+      mirror_of   TEXT,               -- mirror_add：源节点
+      deleted_ids TEXT,               -- delete：JSON 数组（整棵子树）
+      rev_id      INTEGER,            -- 该时刻生效的 revision（add 时为 v1）
+      author      TEXT NOT NULL DEFAULT '',
+      author_id   TEXT NOT NULL DEFAULT '',
+      note        TEXT NOT NULL DEFAULT '',
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_timeline_doc ON timeline(doc_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_timeline_node ON timeline(node_id, seq);
   `);
 
-  // 旧库迁移：补 mirror_of 列
+  // 旧库迁移：补 mirror_of 列（必须先于该列的索引创建）
   const cols = db.prepare('PRAGMA table_info(nodes)').all();
   if (!cols.some((c) => c.name === 'mirror_of')) {
     db.exec('ALTER TABLE nodes ADD COLUMN mirror_of TEXT');
   }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_mirror ON nodes(mirror_of) WHERE mirror_of IS NOT NULL');
 
+  backfillTimeline(db);
   seedIfEmpty(db);
   return db;
+}
+
+// 旧库（没有 timeline 的时代）升级：按 created_at 尽力重放一条时间轴。
+// 能恢复：每段的创建（含初始正文）与全部内容保存；软删节点补一条迁移时刻的
+// delete。恢复不了：历史上的移动轨迹（parent/pos 只能按当前值回填）。
+// 启用之后的操作都是精确记录，回看从升级点开始严格准确。
+function backfillTimeline(db) {
+  const has = db.prepare('SELECT COUNT(*) AS c FROM timeline').get().c > 0;
+  if (has) return;
+  const hasData =
+    db.prepare('SELECT COUNT(*) AS c FROM revisions').get().c > 0 ||
+    db.prepare('SELECT COUNT(*) AS c FROM nodes').get().c > 0;
+  if (!hasData) return; // 全新库：seed 会自己写事件
+
+  const now = Date.now();
+  const ins = db.prepare(
+    `INSERT INTO timeline (doc_id, kind, node_id, parent_id, pos, mirror_of, deleted_ids, rev_id, author, author_id, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+  );
+  const revOf = db.prepare('SELECT * FROM revisions WHERE node_id = ? AND version = ?');
+  const events = [];
+  for (const n of db.prepare('SELECT * FROM nodes').all()) {
+    const v1 = revOf.get(n.id, 1);
+    events.push({
+      at: n.created_at, pri: 0,
+      run: () => ins.run(
+        n.doc_id, n.mirror_of ? 'mirror_add' : 'add', n.id, n.parent_id, n.pos,
+        n.mirror_of, null, v1 ? v1.id : null, '系统', '迁移回填', n.created_at,
+      ),
+    });
+  }
+  for (const r of db.prepare('SELECT * FROM revisions WHERE version >= 2').all()) {
+    events.push({
+      at: r.created_at, pri: 1,
+      run: () => ins.run(r.doc_id, 'content', r.node_id, null, null, null, null, r.id, r.author, r.note, r.created_at),
+    });
+  }
+  // 软删节点：整棵子树在 nodes 表里各自 deleted=1，逐个补 delete 事件即可
+  for (const n of db.prepare('SELECT * FROM nodes WHERE deleted = 1').all()) {
+    events.push({
+      at: now, pri: 2,
+      run: () => ins.run(n.doc_id, 'delete', n.id, null, null, null, JSON.stringify([n.id]), null, '系统', '迁移回填（此前已被删除）', now),
+    });
+  }
+  events.sort((a, b) => a.at - b.at || a.pri - b.pri);
+  const tx = db.transaction(() => {
+    for (const e of events) e.run();
+  });
+  tx();
 }
 
 function seedIfEmpty(db) {
@@ -88,13 +160,32 @@ function seedIfEmpty(db) {
   const tx = db.transaction((items) => {
     for (const it of items) {
       insNode.run(it.id, DEFAULT_DOC, it.parent, it.pos, now);
-      insRev.run(it.id, DEFAULT_DOC, it.text, now);
+      const revId = insRev.run(it.id, DEFAULT_DOC, it.text, now).lastInsertRowid;
+      logEvent(db, {
+        docId: DEFAULT_DOC, kind: 'add', nodeId: it.id, parentId: it.parent, pos: it.pos,
+        revId, author: '系统', authorId: 'system', note: '初始内容', at: now,
+      });
     }
   });
   tx(seed);
 }
 
 // ---------- 文档 ----------
+
+// 追加一条时间轴事件（必须在调用方的事务里用，与数据写入同生共死）
+function logEvent(db, {
+  docId, kind, nodeId, parentId = null, pos = null, mirrorOf = null,
+  deletedIds = null, revId = null, author = '', authorId = '', note = '', at = null,
+}) {
+  db.prepare(
+    `INSERT INTO timeline (doc_id, kind, node_id, parent_id, pos, mirror_of, deleted_ids, rev_id, author, author_id, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    docId, kind, nodeId, parentId, pos, mirrorOf,
+    deletedIds ? JSON.stringify(deletedIds) : null, revId,
+    author, authorId, note, at ?? Date.now(),
+  );
+}
 
 function listDocuments(db) {
   return db
@@ -272,6 +363,10 @@ function saveContent(db, { nodeId, content, expectedVersion, userId, userName, n
       )
       .run(nodeId, node.doc_id, version, content, userId, userName, note || '', now);
     const revision = getRevision(db, nodeId, info.lastInsertRowid);
+    logEvent(db, {
+      docId: node.doc_id, kind: 'content', nodeId, revId: revision.id,
+      author: userName, authorId: userId, note: note || '', at: now,
+    });
     return { status: 'saved', revision };
   })();
 }
@@ -282,10 +377,14 @@ function addNode(db, { id, docId, parentId, pos, content, userId, userName }) {
     db.prepare(
       'INSERT INTO nodes (id, doc_id, parent_id, pos, deleted, created_at) VALUES (?, ?, ?, ?, 0, ?)',
     ).run(id, docId, parentId, pos, now);
-    db.prepare(
+    const revId = db.prepare(
       `INSERT INTO revisions (node_id, doc_id, version, content, author_id, author, note, created_at)
        VALUES (?, ?, 1, ?, ?, ?, '新建段落', ?)`,
-    ).run(id, docId, content || '', userId, userName, now);
+    ).run(id, docId, content || '', userId, userName, now).lastInsertRowid;
+    logEvent(db, {
+      docId, kind: 'add', nodeId: id, parentId, pos, revId,
+      author: userName, authorId: userId, note: '新建段落', at: now,
+    });
     bumpTreeRev(db, docId, now);
     const node = getSnapshot(db, docId).nodes.find((n) => n.id === id);
     return { node, treeRev: getDoc(db, docId).tree_rev };
@@ -293,12 +392,16 @@ function addNode(db, { id, docId, parentId, pos, content, userId, userName }) {
 }
 
 // 挂一个跟读节点（自身无正文、无 revision）
-function addMirrorNode(db, { id, docId, parentId, pos, mirrorOf }) {
+function addMirrorNode(db, { id, docId, parentId, pos, mirrorOf, userId = '', userName = '' }) {
   return db.transaction(() => {
     const now = Date.now();
     db.prepare(
       'INSERT INTO nodes (id, doc_id, parent_id, pos, mirror_of, deleted, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
     ).run(id, docId, parentId, pos, mirrorOf, now);
+    logEvent(db, {
+      docId, kind: 'mirror_add', nodeId: id, parentId, pos, mirrorOf,
+      author: userName, authorId: userId, note: '挂载跟读', at: now,
+    });
     bumpTreeRev(db, docId, now);
     const node = getSnapshot(db, docId).nodes.find((n) => n.id === id);
     return { node, treeRev: getDoc(db, docId).tree_rev };
@@ -312,7 +415,7 @@ function bumpTreeRev(db, docId, now = Date.now()) {
   );
 }
 
-function moveNode(db, { nodeId, parentId, pos, treeRev }) {
+function moveNode(db, { nodeId, parentId, pos, treeRev, userId = '', userName = '' }) {
   return db.transaction(() => {
     const node = getNode(db, nodeId);
     if (!node) return { status: 'missing' };
@@ -327,18 +430,23 @@ function moveNode(db, { nodeId, parentId, pos, treeRev }) {
       nodeId,
     );
     const rev = doc.tree_rev + 1;
+    const now = Date.now();
     db.prepare('UPDATE documents SET tree_rev = ?, updated_at = ? WHERE id = ?').run(
       rev,
-      Date.now(),
+      now,
       doc.id,
     );
+    logEvent(db, {
+      docId: doc.id, kind: 'move', nodeId, parentId, pos,
+      author: userName, authorId: userId, note: '移动/调整层级', at: now,
+    });
     return { status: 'moved', treeRev: rev };
   })();
 }
 
 // 软删除节点及其所有后代。
 // 普通节点：连带子树；跟读节点：没有子级（创建时禁止），只移除这一处挂载，源不受影响。
-function deleteNode(db, { nodeId, treeRev }) {
+function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
   return db.transaction(() => {
     const node = getNode(db, nodeId);
     if (!node) return { status: 'missing' };
@@ -361,6 +469,11 @@ function deleteNode(db, { nodeId, treeRev }) {
     }
     const stmt = db.prepare('UPDATE nodes SET deleted = 1 WHERE id = ?');
     for (const id of ids) stmt.run(id);
+    logEvent(db, {
+      docId: doc.id, kind: 'delete', nodeId, deletedIds: ids,
+      author: userName, authorId: userId,
+      note: node.mirror_of ? '移除跟读' : `删除段落（含子树共 ${ids.length} 段）`,
+    });
     bumpTreeRev(db, doc.id);
     return {
       status: 'deleted',
@@ -369,6 +482,147 @@ function deleteNode(db, { nodeId, treeRev }) {
       kind: node.mirror_of ? 'mirror' : 'node',
     };
   })();
+}
+
+// ---------- 整份时间轴：时刻列表与历史快照 ----------
+
+function latestSeq(db) {
+  return db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM timeline').get().s;
+}
+
+function clip(text, n = 24) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
+
+// 全局事件流（倒序）。时刻坐标 seq 跨文档统一：跟读宿主文档与源文档
+// 用同一把时间尺，"回到时刻 S" 在两份大纲里指向严格同一状态。
+function getTimeline(db, limit = 300) {
+  const rows = db
+    .prepare(
+      `SELECT t.seq, t.doc_id AS docId, d.title AS docTitle, t.kind, t.node_id AS nodeId,
+              t.deleted_ids AS deletedIds, t.author, t.note, t.created_at AS createdAt,
+              r.content AS revContent
+       FROM timeline t
+       LEFT JOIN documents d ON d.id = t.doc_id
+       LEFT JOIN revisions r ON r.id = t.rev_id
+       ORDER BY t.seq DESC LIMIT ?`,
+    )
+    .all(limit);
+  return rows.map((r) => {
+    let summary;
+    if (r.kind === 'add') summary = `新增段落「${clip(r.revContent)}」`;
+    else if (r.kind === 'content') summary = `修改段落「${clip(r.revContent)}」`;
+    else if (r.kind === 'mirror_add') summary = '挂载跟读';
+    else if (r.kind === 'move') summary = '移动段落 / 调整层级';
+    else if (r.kind === 'delete') {
+      summary = `删除段落（共 ${(JSON.parse(r.deletedIds || '[]')).length} 段）`;
+    } else summary = r.kind;
+    return {
+      seq: r.seq, docId: r.docId, docTitle: r.docTitle || '', kind: r.kind,
+      nodeId: r.nodeId, summary, author: r.author, note: r.note, createdAt: r.createdAt,
+    };
+  });
+}
+
+// 把整份大纲重建到时刻 seq：结构按事件重放，内容取每段当时生效的 revision；
+// 跟读行投影源节点在同一 seq 的内容（seq 全局单调，跨文档严格同一时刻）。
+// 结果是 seq 的纯函数：任何人、任何时候请求，拿到的都是同一份。
+function getSnapshotAt(db, docId, seq) {
+  const doc = getDoc(db, docId);
+  if (!doc) return null;
+  const maxSeq = latestSeq(db);
+  const at = Math.max(0, Math.min(Number(seq) || 0, maxSeq));
+  const atRow = at > 0
+    ? db.prepare('SELECT created_at AS createdAt FROM timeline WHERE seq = ?').get(at)
+    : null;
+
+  // 1) 结构：全局重放（跟读源可能在别的大纲，必须一起重放才知道源当时是否存活）
+  const structEvents = db
+    .prepare(
+      `SELECT kind, node_id AS nodeId, doc_id AS docId, parent_id AS parentId, pos,
+              mirror_of AS mirrorOf, deleted_ids AS deletedIds
+       FROM timeline WHERE kind != 'content' AND seq <= ? ORDER BY seq`,
+    )
+    .all(at);
+  const tree = new Map(); // nodeId -> { docId, parentId, pos, mirrorOf, deleted }
+  for (const e of structEvents) {
+    if (e.kind === 'add' || e.kind === 'mirror_add') {
+      tree.set(e.nodeId, {
+        docId: e.docId, parentId: e.parentId, pos: e.pos, mirrorOf: e.mirrorOf, deleted: 0,
+      });
+    } else if (e.kind === 'move') {
+      const n = tree.get(e.nodeId);
+      if (n && !n.deleted) {
+        n.parentId = e.parentId;
+        n.pos = e.pos;
+      }
+    } else if (e.kind === 'delete') {
+      for (const id of JSON.parse(e.deletedIds || '[]')) {
+        const n = tree.get(id);
+        if (n) n.deleted = 1;
+      }
+    }
+  }
+
+  // 2) 内容：每个节点在 at 时刻生效的 revision（一次批量查询）
+  const contentRows = db
+    .prepare(
+      `SELECT t.node_id AS nodeId, r.version, r.content, r.author,
+              r.author_id AS authorId, r.created_at AS updatedAt
+       FROM timeline t
+       JOIN (SELECT node_id, MAX(seq) AS ms FROM timeline
+             WHERE rev_id IS NOT NULL AND seq <= ? GROUP BY node_id) latest
+         ON latest.node_id = t.node_id AND latest.ms = t.seq
+       JOIN revisions r ON r.id = t.rev_id`,
+    )
+    .all(at);
+  const contentAt = new Map(contentRows.map((r) => [r.nodeId, r]));
+
+  // 3) 当前存活状态：前端用它把"此刻已被删"的段落的「接着改」按钮置灰
+  const aliveNow = new Set(
+    db.prepare('SELECT id FROM nodes WHERE deleted = 0').all().map((r) => r.id),
+  );
+
+  // 4) 组装该文档在 at 时刻的可见树（格式与实时快照一致）
+  const nodes = [];
+  for (const [id, n] of tree) {
+    if (n.docId !== docId || n.deleted) continue;
+    if (!n.mirrorOf) {
+      const c = contentAt.get(id);
+      nodes.push({
+        id, parentId: n.parentId, pos: n.pos, kind: 'node',
+        version: c ? c.version : 0,
+        content: c ? c.content : '',
+        author: c ? c.author : '',
+        authorId: c ? c.authorId : '',
+        updatedAt: c ? c.updatedAt : null,
+        aliveNow: aliveNow.has(id) ? 1 : 0,
+      });
+    } else {
+      const src = tree.get(n.mirrorOf);
+      const gone = !src || src.deleted;
+      const node = {
+        id, parentId: n.parentId, pos: n.pos, kind: 'mirror', mirrorOf: n.mirrorOf,
+        sourceDocId: src ? src.docId : null,
+        sourceDeleted: gone ? 1 : 0,
+        aliveNow: aliveNow.has(id) ? 1 : 0,
+        sourceAliveNow: aliveNow.has(n.mirrorOf) ? 1 : 0,
+      };
+      if (!gone) {
+        const c = contentAt.get(n.mirrorOf);
+        if (c) {
+          node.version = c.version;
+          node.content = c.content;
+          node.author = c.author;
+          node.authorId = c.authorId;
+          node.updatedAt = c.updatedAt;
+        }
+      }
+      nodes.push(node);
+    }
+  }
+  return { doc, asOf: { seq: at, createdAt: atRow ? atRow.createdAt : null, latestSeq: maxSeq }, nodes };
 }
 
 module.exports = {
@@ -390,4 +644,7 @@ module.exports = {
   addMirrorNode,
   moveNode,
   deleteNode,
+  latestSeq,
+  getTimeline,
+  getSnapshotAt,
 };

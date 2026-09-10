@@ -404,6 +404,39 @@ function handleHistory(peer, msg) {
   send(peer, { type: 'history', nodeId, items });
 }
 
+// ---------- 整份时间轴：按时刻回看整棵树的层级与正文 ----------
+
+function handleTimeline(peer) {
+  send(peer, {
+    type: 'timeline',
+    latestSeq: store.latestSeq(db),
+    items: store.getTimeline(db, 300),
+  });
+}
+
+// 把指定文档重建到时刻 seq（结构+正文；跟读投影源在同一 seq 的内容）。
+// 重建是 seq 的纯函数：所有人拿到同一份结果，不存在"各看各的"。
+function handleSnapshotAt(peer, msg) {
+  const docId = String(msg.docId || '');
+  const seq = Number(msg.seq);
+  if (!store.getDoc(db, docId)) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  if (!Number.isInteger(seq) || seq < 1) {
+    send(peer, { type: 'error', message: '缺少有效的时刻序号' });
+    return;
+  }
+  const snap = store.getSnapshotAt(db, docId, seq);
+  send(peer, {
+    type: 'snapshot_at',
+    docId,
+    title: snap.doc.title,
+    asOf: snap.asOf,
+    nodes: snap.nodes,
+  });
+}
+
 // 冲突解决后用户选定最终文本，再次走保存（基准为当前最新版本）
 function handleResolve(peer, msg) {
   const nodeId = String(msg.nodeId || '');
@@ -522,6 +555,8 @@ function handleAddMirror(peer, msg) {
     parentId,
     pos,
     mirrorOf: sourceId,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
   });
   sendToDoc(hostDocId, {
     type: 'mirror_added',
@@ -578,7 +613,10 @@ function handleMove(peer, msg) {
     }
   }
   const pos = computePosForMove(db, doc.id, parentId, afterId, nodeId);
-  const result = store.moveNode(db, { nodeId, parentId, pos, treeRev });
+  const result = store.moveNode(db, {
+    nodeId, parentId, pos, treeRev,
+    userId: peer.user.userId, userName: peer.user.userName,
+  });
   if (result.status === 'stale') {
     sendStale(peer, doc);
     return;
@@ -626,7 +664,10 @@ function handleDelete(peer, msg) {
 
   // 跟读行：只摘掉这一处挂载，源段落与别处跟读都不受影响
   if (row.mirror_of) {
-    const result = store.deleteNode(db, { nodeId, treeRev: Number(msg.treeRev) });
+    const result = store.deleteNode(db, {
+      nodeId, treeRev: Number(msg.treeRev),
+      userId: peer.user.userId, userName: peer.user.userName,
+    });
     if (result.status !== 'deleted') return;
     sendToDoc(doc.id, {
       type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
@@ -634,7 +675,10 @@ function handleDelete(peer, msg) {
     return;
   }
 
-  const result = store.deleteNode(db, { nodeId, treeRev: Number(msg.treeRev) });
+  const result = store.deleteNode(db, {
+    nodeId, treeRev: Number(msg.treeRev),
+    userId: peer.user.userId, userName: peer.user.userName,
+  });
   if (result.status !== 'deleted') return;
 
   // 释放被删子树上所有编辑锁（锁以源 id 为键），并通知各房间
@@ -696,6 +740,8 @@ wss.on('connection', (ws) => {
         case 'restore_save': handleRestoreSave(peer, msg); break;
         case 'resolve': handleResolve(peer, msg); break;
         case 'history': handleHistory(peer, msg); break;
+        case 'timeline': handleTimeline(peer, msg); break;
+        case 'snapshot_at': handleSnapshotAt(peer, msg); break;
         case 'add': handleAdd(peer, msg); break;
         case 'move': handleMove(peer, msg); break;
         case 'delete': handleDelete(peer, msg); break;

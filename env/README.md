@@ -7,7 +7,8 @@
 | 看出别人正在改哪段 | 段落级**软锁**，编辑者头像+姓名显示在段落上，在线名单实时更新 |
 | 关页面/无操作后锁自动消失 | WS `close` 立即释放；心跳续租；服务器 TTL 扫描 + ping 探活兜底；本地 30 秒无输入主动释放 |
 | 多人改同段最终必须收敛 | **服务器是唯一事实源**，保存带版本号；过期提交做 token 级 **diff3 三方合并**，不相交改动自动合成一个新版本全员广播；真重叠**拒绝并弹冲突窗**，不存在"各自成功" |
-| 按时间回看、回退后继续改 | 每次保存是 append-only `revisions`；回退不是覆盖，而是**载入旧版本当草稿**再走一次合并保存（diff4），别人不相交的改动自动保留 |
+| 按整份来回看时间 | 结构与内容共用一张 append-only `timeline`（全局单调 seq 即"时刻"）：任意时刻可重建**整棵树的层级+正文**；跟读行投影源在**同一时刻**的内容，源这份和跟读这份严格对照，所有人看到同一份 |
+| 从旧时刻接着改 | 不是覆盖，而是**另开一条线**：该时刻的正文载入草稿，保存时以旧版本为共同祖先做三方合并（diff4）——现在这条线上别人后来写下、没撞上的改动自动保留；两人从同一时刻接着改，仍走合并/冲突裁决收敛成同一份 |
 | Docker 部署 | 单镜像 + 一个命名卷，`docker compose up -d` |
 
 > 锁只是**协作提示**，不参与正确性。即使绕过锁（或锁刚好过期时两人同时提交），
@@ -52,7 +53,9 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（16 个场景）
+npm test                  # WebSocket 端到端（16 + 11 + 7 个场景）+ 单元测试
+node test/client.smoke.test.js            # jsdom 客户端冒烟：多文档 + 跟读全流程
+node test/client.timetravel.smoke.test.js # jsdom 客户端冒烟：整份时间轴回看全流程
 node test/fraction.test.js        # 分数索引：6000 次随机插入顺序不变
 node test/merge.test.js           # diff3 固定用例
 node test/merge.property.test.js  # 4000 组随机编辑：交换律/无误报冲突
@@ -62,18 +65,25 @@ node test/merge.property.test.js  # 4000 组随机编辑：交换律/无误报�
 **空闲活连接跨多个 ping 周期不被掐**（回归）、版本保存广播、
 过期提交自动合并与收敛、真冲突拒绝与裁决收敛、历史留痕、
 回退 diff4 保留他人改动、增/降级/删结构操作、过期树版本拒绝、
-断线重连补齐离线期间修改。
+断线重连补齐离线期间修改、多文档与跟读投影/跨文档锁/源删除墓碑、
+**整份时间轴**（事件单调、整树时刻重建、源与跟读同一时刻对照、
+两人从同一旧时刻接着改的收敛与裁决、已删段落拒绝接着改、旧库迁移回填）。
 
 ---
 
 ## 使用说明
 
 - 进入页面输入名字即可（身份随机生成存在 `localStorage`，头像颜色由身份哈希决定）。
-- 段落悬浮出现操作条：**编辑 / ＋子级 / ＋同级 / 历史**。
+- 段落悬浮出现操作条：**编辑 / ＋子级 / ＋同级 / 挂跟读 / 历史**。
 - 编辑中：`Ctrl+Enter` 保存、`Esc` 取消；工具条可升级/降级/上下移动/删除。
 - 别人正在编辑的段落会高亮并显示头像，编辑按钮会被服务器拒绝。
-- 历史抽屉里每一条 revision 都可以「以此版本继续编辑」：
-  旧文本载入编辑器，保存时以该旧版本为共同祖先做四方合并。
+- 顶栏「🕘 时间轴」打开**整份时间轴**：每条事件（新增/修改/移动/删除/挂跟读）都是一个可回看的时刻。
+  点「回到这一刻」，当前大纲的**层级与正文整体**回到当时（只读）；切到挂了跟读的大纲，
+  看到的是**同一时刻**的对照（时刻坐标全局统一，任何人打开都一样）。
+- 回看时点段落上的「从此刻继续编辑」：该时刻的正文载入编辑器，保存时与现在的内容三方合并——
+  另开一条线往下写，别人在此之后不冲突的改动自动保留，真重叠仍会弹冲突窗。
+  当前已被删除的段落会标注「当前已删除」，不能接着改。
+- 历史抽屉里每一条 revision 也都可以「以此版本继续编辑」（单段视角的同一机制）。
 - 真冲突时弹出三栏窗口（你的版本 / 对方版本 / 最终内容），可以选边或手工合并后提交。
 
 ---
@@ -91,7 +101,8 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
    └── db.js       better-sqlite3（同步事务）
                       ├── documents  (tree_rev 结构乐观锁)
                       ├── nodes      (parent_id, pos, deleted 软删)
-                      └── revisions  (node_id, version 单调, content, author, note)
+                      ├── revisions  (node_id, version 单调, content, author, note)
+                      └── timeline   (全局 seq 时刻：结构+内容事件，整树可重建)
 ```
 
 ### 收敛协议要点
@@ -105,6 +116,11 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 - 合并满足交换律（A 先来还是 B 先来，最终文本一致），算法层有随机属性测试守护。
 - 结构操作（增/移/删）用文档级 `tree_rev` 乐观锁；过期操作被拒绝，
   服务器紧接着下发一份完整快照纠正客户端。
+- 整份时间轴：每次内容保存与结构变更都追加一条 `timeline` 事件（同事务），
+  全局单调 `seq` 是内容和结构共用的时刻坐标。`snapshot_at` 按 seq 重放结构事件、
+  取每段当时生效的 revision，重建结果是 seq 的**纯函数**——不依赖请求人、
+  不依赖请求时机，天然"大家看到的一样"。跟读行投影源节点在同一 seq 的内容，
+  源这份和跟读这份用同一个 seq 即可严格对照。
 
 ### 占用状态生命周期
 
@@ -132,9 +148,11 @@ hello {userId, userName}
 lock {nodeId}            unlock {nodeId}
 heartbeat {nodeId?}
 save {nodeId, content, baseVersion}
-restore_save {nodeId, content, restoreVersion}   # 历史回退后保存（diff4）
+restore_save {nodeId, content, restoreVersion}   # 从旧版本/旧时刻接着改（diff4 另开一条线）
 resolve {nodeId, content, keep}                  # 冲突裁决
 history {nodeId}
+timeline                                         # 拉整份时间轴（全局事件流）
+snapshot_at {docId, seq}                         # 把某份大纲重建到时刻 seq
 add {parentId, afterId, content, treeRev}
 move {nodeId, parentId, afterId, treeRev}
 delete {nodeId, treeRev}
@@ -155,6 +173,8 @@ saved {nodeId, revision}
 merge_notice {nodeId, revision, message}
 conflict {nodeId, reason, base?, local, remote, current}
 history {nodeId, items[]}
+timeline {latestSeq, items[]}                    # items: {seq, kind, summary, author, docTitle, createdAt}
+snapshot_at {docId, title, asOf{seq, createdAt, latestSeq}, nodes[]}
 node_added {node, treeRev}
 node_moved {nodeId, parentId, pos, treeRev}
 nodes_deleted {ids[], treeRev}
@@ -169,9 +189,17 @@ error {message}
 
 - **同一点插入不同内容算冲突**：两人都在同一句的同一个 token 间隙插入，
   机器无法判断谁该在前，交给用户。这与 `git merge-file` 的保守策略一致。
-- **回退不是"覆盖回旧版"**：历史版本只读；回退产生一条**新版本**。
-  如果回退点之后别人恰好改过你要恢复的那一块文本，同样会弹冲突窗——
-  这正是"不能无故抹掉别人改动"的代价：宁可多问一次，绝不静默覆盖。
+- **回退/接着改不是"覆盖回旧版"**：历史版本只读；从旧时刻接着改产生一条**新版本**
+  （历史里注明来源版本）。如果旧时刻之后别人恰好改过你要恢复的那一块文本，
+  同样会弹冲突窗——这正是"不能无故抹掉别人改动"的代价：宁可多问一次，绝不静默覆盖。
+- **回看是整份只读**：回看模式下不能增/移/删段落（结构没有"从旧时刻分叉"的说法），
+  只能对单段「从此刻继续编辑」；当前已删除的段落不能接着改（历史仍可查）。
+- **时刻坐标是全局 seq 而不是墙钟时间**：同一毫秒内的多个事件也有严格先后；
+  跨文档（源与跟读宿主）用同一坐标对照，不存在时区/时钟偏移问题。
+- **大纲标题不参与回看**：标题没有历史，回看的只是层级与正文。
+- **旧库迁移是尽力而为**：升级前的数据按 `created_at` 回填时间轴
+  （创建/内容保存/软删可恢复；历史上的移动轨迹不可考，按当前层级回填）。
+  升级之后的每个操作都精确记录。
 - **删除段落是软删（带子树）**：历史 revisions 仍在数据库；当前版本不提供回收站 UI。
 - 单文档、单实例部署。SQLite 配合单 Node 进程足够支撑小团队；
   要横向扩展需要把锁状态和广播搬到 Redis/PostgreSQL LISTEN，不在当前范围。
