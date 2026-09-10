@@ -11,12 +11,12 @@
 //   5. 心跳超时（网络静默、电脑休眠）-> sweep() 按 TTL 回收。
 
 class LockManager {
-  constructor({ ttlMs = 30000, sweepIntervalMs = 5000 } = {}) {
+  constructor({ ttlMs = 30000 } = {}) {
     this.ttlMs = ttlMs;
     // nodeId -> { userId, userName, color, connId, at }
     this.locks = new Map();
-    this._timer = setInterval(() => this.sweep(), sweepIntervalMs);
-    this._timer.unref?.();
+    // 不在这里定时 sweep：静默删锁会让服务端 sweepAndBroadcast 拿不到过期列表，
+    // 源文档和跟读侧都收不到 unlocked(reason=ttl)。
   }
 
   // 返回 null 表示成功；否则返回当前持有者（供客户端提示"正被谁编辑"）

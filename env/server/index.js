@@ -26,7 +26,7 @@ function colorFor(userId) {
 }
 
 const db = store.init(DB_FILE);
-const locks = new LockManager({ ttlMs: LOCK_TTL, sweepIntervalMs: 5000 });
+const locks = new LockManager({ ttlMs: LOCK_TTL });
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
