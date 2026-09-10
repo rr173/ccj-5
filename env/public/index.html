@@ -23,6 +23,7 @@
       <div class="title-wrap">
         <h2 id="doc-title">协同大纲</h2>
         <span id="conn-state" class="conn-dot" title="连接状态"></span>
+        <span id="sync-state" class="sync-state hidden" role="button" title=""></span>
       </div>
       <div class="top-actions">
         <span id="editing-hint" class="editing-hint hidden"></span>
@@ -111,16 +112,16 @@
   <!-- 冲突解决弹窗 -->
   <div id="conflict-mask" class="conflict-mask hidden">
     <div class="conflict-card">
-      <h3>保存冲突：同一段被两个人改到了同一处</h3>
-      <p class="muted">
+      <h3 id="conflict-title">保存冲突：同一段被两个人改到了同一处</h3>
+      <p class="muted" id="conflict-sub">
         你们基于同一版本改了重叠的内容，服务器没有替任何人覆盖。请选择最终保留的文本——
         其他人在此版本之后的<b>其它不冲突改动不会丢失</b>。
       </p>
       <div class="conflict-cols">
-        <label>你的版本
+        <label><span id="conflict-local-label">你的版本</span>
           <textarea id="conflict-local" rows="8"></textarea>
         </label>
-        <label>对方版本（当前服务器内容）
+        <label><span id="conflict-remote-label">对方版本（当前服务器内容）</span>
           <textarea id="conflict-remote" rows="8"></textarea>
         </label>
       </div>

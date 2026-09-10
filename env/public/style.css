@@ -94,6 +94,29 @@ button.danger { color: var(--danger); border-color: #f3c0c0; }
   padding: 3px 10px; border-radius: 999px;
 }
 
+/* 离线同步状态：顶栏胶囊 + 段落徽章 */
+.sync-state {
+  font-size: 12px; color: var(--warn);
+  background: #fff7e8; border: 1px solid #f3dfb3;
+  padding: 2px 10px; border-radius: 999px; cursor: pointer;
+  max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sync-state.has-conflict {
+  color: var(--danger); background: #fdf0ef; border-color: #f3c0c0;
+}
+.sync-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; border-radius: 999px; padding: 1px 10px; cursor: pointer;
+}
+.sync-badge.pending {
+  color: #8a5a00; background: #fff7e8; border: 1px solid #f3dfb3;
+}
+.sync-badge.conflict {
+  color: var(--danger); background: #fdf0ef; border: 1px solid #f3c0c0;
+  font-weight: 600;
+}
+.sync-badge.conflict:hover { background: #fbe3e1; }
+
 /* 标签页：多份大纲 */
 .tabbar {
   display: flex; align-items: stretch; gap: 6px;

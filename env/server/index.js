@@ -234,19 +234,30 @@ function handleHeartbeat(peer, msg) {
 // 无论编辑入口在源段落还是某个跟读，nodeId 永远是源节点 id
 // （跟读没有自己的正文），所以"两人在不同挂载点改同一段"就是
 // 现有协议里"两人改同一段"：合并/冲突裁决保证唯一收敛。
+//
+// clientTag：客户端（离线回放队列）给每条保存贴的回执标签，服务器原样透传
+// 回 saved / merge_notice / conflict / error，客户端据此把回执对号到
+// 具体的离线改动，不会误触当前正在进行的交互式编辑会话。
+
+function clientTagOf(msg) {
+  return typeof msg.clientTag === 'string' && msg.clientTag
+    ? msg.clientTag.slice(0, 64)
+    : undefined;
+}
 
 function handleSave(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
   const expectedVersion = Number(msg.baseVersion);
+  const clientTag = clientTagOf(msg);
   if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
-    send(peer, { type: 'error', message: '缺少基准版本号' });
+    send(peer, { type: 'error', message: '缺少基准版本号', clientTag });
     return;
   }
 
   const node = store.getNode(db, nodeId);
   if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
+    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
   const latest = store.getLatestRevision(db, nodeId);
@@ -262,9 +273,9 @@ function handleSave(peer, msg) {
     });
     if (result.status === 'saved') {
       broadcastContent(nodeId, result.revision, peer.connId);
-      send(peer, { type: 'saved', nodeId, revision: result.revision });
+      send(peer, { type: 'saved', nodeId, revision: result.revision, clientTag });
     } else if (result.status === 'noop') {
-      send(peer, { type: 'saved', nodeId, revision: latest, merged: false });
+      send(peer, { type: 'saved', nodeId, revision: latest, merged: false, clientTag });
     }
     return;
   }
@@ -278,6 +289,7 @@ function handleSave(peer, msg) {
       reason: 'history_gone',
       current: latest,
       message: '你基于的历史版本已不存在，请刷新后重试',
+      clientTag,
     });
     return;
   }
@@ -292,6 +304,7 @@ function handleSave(peer, msg) {
       local: content,
       remote: latest.content,
       current: latest,
+      clientTag,
     });
     return;
   }
@@ -311,9 +324,13 @@ function handleSave(peer, msg) {
       nodeId,
       revision: result.revision,
       message: '已和其他人的修改自动合并',
+      clientTag,
     });
+  } else if (result.status === 'noop') {
+    // 合并结果与线上完全一致（双方离线改成了一样）：已收敛，算成功而非失败
+    send(peer, { type: 'saved', nodeId, revision: latest, clientTag });
   } else {
-    send(peer, { type: 'error', nodeId, message: '保存失败，请重试' });
+    send(peer, { type: 'error', nodeId, message: '保存失败，请重试', clientTag });
   }
 }
 
@@ -336,14 +353,15 @@ function handleRestoreSave(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
   const restoreVersion = Number(msg.restoreVersion);
+  const clientTag = clientTagOf(msg);
   if (!Number.isInteger(restoreVersion) || restoreVersion < 1) {
-    send(peer, { type: 'error', message: '缺少回退基准版本号' });
+    send(peer, { type: 'error', message: '缺少回退基准版本号', clientTag });
     return;
   }
 
   const node = store.getNode(db, nodeId);
   if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
+    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
   const latest = store.getLatestRevision(db, nodeId);
@@ -351,7 +369,7 @@ function handleRestoreSave(peer, msg) {
   if (!baseRev) {
     send(peer, {
       type: 'conflict', nodeId, reason: 'history_gone', current: latest,
-      message: '你基于的历史版本已不存在，请刷新后重试',
+      message: '你基于的历史版本已不存在，请刷新后重试', clientTag,
     });
     return;
   }
@@ -363,6 +381,7 @@ function handleRestoreSave(peer, msg) {
       send(peer, {
         type: 'conflict', nodeId, reason: 'overlap',
         base: baseRev.content, local: content, remote: latest.content, current: latest,
+        clientTag,
       });
       return;
     }
@@ -370,7 +389,7 @@ function handleRestoreSave(peer, msg) {
   }
 
   if (finalText === latest.content) {
-    send(peer, { type: 'saved', nodeId, revision: latest });
+    send(peer, { type: 'saved', nodeId, revision: latest, clientTag });
     return;
   }
 
@@ -392,9 +411,10 @@ function handleRestoreSave(peer, msg) {
       message: latest.version !== restoreVersion
         ? '已回退并自动保留其他人不冲突的改动'
         : '已基于历史版本创建新版本',
+      clientTag,
     });
   } else {
-    send(peer, { type: 'error', nodeId, message: '保存失败，请重试' });
+    send(peer, { type: 'error', nodeId, message: '保存失败，请重试', clientTag });
   }
 }
 
@@ -441,9 +461,10 @@ function handleSnapshotAt(peer, msg) {
 function handleResolve(peer, msg) {
   const nodeId = String(msg.nodeId || '');
   const content = String(msg.content ?? '').slice(0, 100_000);
+  const clientTag = clientTagOf(msg);
   const node = store.getNode(db, nodeId);
   if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除' });
+    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
   const latest = store.getLatestRevision(db, nodeId);
@@ -457,8 +478,11 @@ function handleResolve(peer, msg) {
   });
   if (result.status === 'saved') {
     broadcastContent(nodeId, result.revision, peer.connId);
-    send(peer, { type: 'saved', nodeId, revision: result.revision });
-  } else send(peer, { type: 'error', nodeId, message: '保存失败，请重试' });
+    send(peer, { type: 'saved', nodeId, revision: result.revision, clientTag });
+  } else if (result.status === 'noop') {
+    // 最终文本与线上一致（例如采用对方版本）：已收敛，直接回执成功
+    send(peer, { type: 'saved', nodeId, revision: latest, clientTag });
+  } else send(peer, { type: 'error', nodeId, message: '保存失败，请重试', clientTag });
 }
 
 // ---------- 结构操作（增/删/移动层级 / 挂跟读）----------
@@ -803,7 +827,7 @@ const sweepTimer = setInterval(sweepAndBroadcast, 5000);
 sweepTimer.unref?.();
 
 // 暴露给测试
-module.exports = { server, app, db, locks, sweepAndBroadcast };
+module.exports = { server, app, db, locks, peers, sweepAndBroadcast };
 
 if (require.main === module) {
   server.listen(PORT, () => {

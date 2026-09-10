@@ -25,6 +25,322 @@ const edit = {
 const orphanDrafts = new Map();
 const pendingConflict = { current: null };
 
+/* ================= 离线暂存：断线改的字先落本机，联网后自动对齐 =================
+ *
+ * 断线时的「保存」不走网络，写进 localStorage 队列（同一段只留最新正文 +
+ * 最初的基准版本），本地乐观显示并挂「待同步」徽章；编辑器里没保存的草稿
+ * 也随输入落盘，刷新/关页面都不丢。
+ * 重连拿到服务器最新快照后按序回放队列：每条带 clientTag 走正常 save，
+ * 服务器的版本号 + diff3 合并机制负责与线上对齐——不撞的自动合并全员广播
+ * （跟读行同一份）；撞上的段落留在队列里标 conflict，行内红徽章明示
+ * 「当前以线上为准」，等人裁决，绝不出现"两边都显示成功却对不上"。
+ */
+const OFFLINE_QUEUE_KEY = 'outline.offlineQueue.v1';
+const DRAFTS_KEY = 'outline.drafts.v1';
+
+// op: { id, nodeId, content, baseVersion, restoreFromVersion, queuedAt,
+//       status: 'pending' | 'conflict', conflict?: { base, local, remote, current } }
+const offlineQueue = (() => {
+  const v = loadJson(OFFLINE_QUEUE_KEY, []);
+  return Array.isArray(v) ? v.filter((o) => o && o.nodeId) : [];
+})();
+// sourceId -> { content, baseVersion, restoreFromVersion, at }
+const draftStore = (() => {
+  const v = loadJson(DRAFTS_KEY, {});
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+})();
+
+const offlineSync = {
+  flushing: false,   // 正在逐条回放
+  current: null,     // { op, resolve, wantModal } 在飞的那一条
+  armed: true,       // 重连后收到第一份快照时触发一次回放（页面刚打开也算）
+};
+
+function loadJson(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || '');
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function persistOfflineQueue() {
+  try {
+    if (offlineQueue.length) localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(offlineQueue));
+    else localStorage.removeItem(OFFLINE_QUEUE_KEY);
+  } catch { /* 存储写不进不阻断编辑 */ }
+  renderSyncState();
+}
+
+let draftSaveTimer = null;
+function persistDraftsNow() {
+  clearTimeout(draftSaveTimer);
+  try {
+    if (Object.keys(draftStore).length) localStorage.setItem(DRAFTS_KEY, JSON.stringify(draftStore));
+    else localStorage.removeItem(DRAFTS_KEY);
+  } catch { /* ignore */ }
+}
+function persistDraftsSoon() {
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(persistDraftsNow, 400);
+}
+
+// 编辑器里还没点保存的草稿随输入落盘：断线/刷新/关页面都不丢
+function rememberDraft() {
+  if (!edit.sourceId) return;
+  draftStore[edit.sourceId] = {
+    content: edit.draft,
+    baseVersion: edit.baseVersion,
+    restoreFromVersion: edit.restoreFromVersion || null,
+    at: Date.now(),
+  };
+  persistDraftsSoon();
+}
+
+function clearPersistedDraft(sourceId) {
+  if (sourceId && draftStore[sourceId]) {
+    delete draftStore[sourceId];
+    persistDraftsSoon();
+  }
+}
+
+// 启动时把上次落盘的未保存草稿装回孤儿草稿池（beginEdit 会认领）
+for (const [k, v] of Object.entries(draftStore)) {
+  if (v && typeof v.content === 'string') orphanDrafts.set(k, v);
+}
+
+function pendingOpFor(sourceId) {
+  return offlineQueue.find((o) => o.nodeId === sourceId) || null;
+}
+
+function removeOp(op) {
+  const idx = offlineQueue.indexOf(op);
+  if (idx >= 0) offlineQueue.splice(idx, 1);
+  persistOfflineQueue();
+}
+
+// 断线保存：同一段只留一条（保留最初基准版本，正文取最新），
+// 本地各行立即乐观显示离线正文（版本号不动，徽章标明"待同步"）。
+function enqueueOfflineSave() {
+  const sourceId = edit.sourceId;
+  const existing = pendingOpFor(sourceId);
+  if (existing) {
+    existing.content = edit.draft;
+    existing.queuedAt = Date.now();
+    existing.status = 'pending';
+    delete existing.conflict;
+  } else {
+    offlineQueue.push({
+      id: 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+      nodeId: sourceId,
+      content: edit.draft,
+      baseVersion: edit.baseVersion,
+      restoreFromVersion: edit.restoreFromVersion || null,
+      queuedAt: Date.now(),
+      status: 'pending',
+    });
+  }
+  persistOfflineQueue();
+  for (const { view, node } of rowsOfSource(sourceId)) {
+    node.content = edit.draft;
+    patchRow(view, node.id);
+  }
+  clearPersistedDraft(sourceId);
+  resetEditState();
+  updateEditingHint();
+  renderActiveDoc();
+  toast('已存到本机（离线）。联网后自动与线上对齐；若与别人撞上会标出来请你裁决', 'ok', 4200);
+}
+
+// ---------- 重连回放：把队列里的离线改动逐条对齐到线上 ----------
+
+async function flushOfflineQueue({ includeConflicts = false } = {}) {
+  if (offlineSync.flushing || !state.connected || !state.me) return;
+  if (includeConflicts) {
+    for (const o of offlineQueue) if (o.status === 'conflict') o.status = 'pending';
+    persistOfflineQueue();
+  }
+  if (!offlineQueue.some((o) => o.status === 'pending')) { renderSyncState(); return; }
+  offlineSync.flushing = true;
+  let saved = 0, merged = 0, conflicts = 0, failed = 0;
+  try {
+    for (;;) {
+      if (!state.connected) break;
+      const op = offlineQueue.find((o) => o.status === 'pending');
+      if (!op) break;
+      const outcome = await syncOneOp(op, { wantModal: false });
+      if (outcome === 'saved') saved++;
+      else if (outcome === 'merged') merged++;
+      else if (outcome === 'conflict') conflicts++;
+      else if (outcome === 'failed') failed++;
+      else break; // aborted：又掉线了，剩下的下次重连接着来
+    }
+  } finally {
+    offlineSync.flushing = false;
+    persistOfflineQueue();
+    renderActiveDoc();
+  }
+  const parts = [];
+  if (saved) parts.push(`${saved} 段已同步`);
+  if (merged) parts.push(`${merged} 段与线上自动合并`);
+  if (conflicts) parts.push(`${conflicts} 段与线上冲突待裁决（当前以线上为准）`);
+  if (failed) parts.push(`${failed} 段未能同步`);
+  if (parts.length) {
+    toast('离线改动对齐：' + parts.join('，'), conflicts || failed ? 'error' : 'ok', 5600);
+  }
+}
+
+// 回放一条离线改动；结果通过带 clientTag 的回执路由回来（routeSyncMessage）
+function syncOneOp(op, { wantModal }) {
+  return new Promise((resolve) => {
+    const payload = op.restoreFromVersion
+      ? {
+          type: 'restore_save', nodeId: op.nodeId, content: op.content,
+          restoreVersion: op.restoreFromVersion, clientTag: op.id,
+        }
+      : {
+          type: 'save', nodeId: op.nodeId, content: op.content,
+          baseVersion: op.baseVersion, clientTag: op.id,
+        };
+    if (!send(payload, { quiet: true })) {
+      resolve('aborted');
+      return;
+    }
+    offlineSync.current = { op, resolve, wantModal };
+  });
+}
+
+function finishSyncWait(tag, outcome) {
+  const cur = offlineSync.current;
+  if (cur && cur.op.id === tag) {
+    offlineSync.current = null;
+    cur.resolve(outcome);
+  }
+}
+
+// 带 clientTag 的回执：属于离线回放，绝不触碰交互式编辑会话
+function routeSyncMessage(msg) {
+  const tag = msg.clientTag;
+  const op = offlineQueue.find((o) => o.id === tag) || null;
+  if (msg.type === 'saved' || msg.type === 'merge_notice') {
+    if (msg.revision) {
+      applyContent({
+        nodeId: msg.revision.node_id || msg.nodeId,
+        version: msg.revision.version,
+        content: msg.revision.content,
+        author: msg.revision.author,
+        authorId: msg.revision.author_id,
+        updatedAt: msg.revision.created_at,
+      }, { silent: true, self: true });
+    }
+    if (op) {
+      removeOp(op);
+      toast(
+        msg.type === 'merge_notice'
+          ? '你的离线改动已与线上最新内容自动合并'
+          : '你的离线改动已同步到线上',
+        'ok', 3000,
+      );
+      renderActiveDoc();
+    }
+    finishSyncWait(tag, msg.type === 'merge_notice' ? 'merged' : 'saved');
+    return;
+  }
+  if (msg.type === 'conflict') {
+    if (op) {
+      op.status = 'conflict';
+      op.conflict = { base: msg.base, local: msg.local, remote: msg.remote, current: msg.current || null };
+      persistOfflineQueue();
+      renderActiveDoc();
+      if (offlineSync.current?.op === op && offlineSync.current.wantModal) {
+        openOfflineConflict(op);
+      }
+    }
+    finishSyncWait(tag, 'conflict');
+    return;
+  }
+  if (msg.type === 'error') {
+    if (op) {
+      removeOp(op);
+      // 不丢字：同步失败的原文存回本机草稿（段落若还在，下次编辑可找回）
+      draftStore[op.nodeId] = {
+        content: op.content,
+        baseVersion: op.baseVersion,
+        restoreFromVersion: op.restoreFromVersion || null,
+        at: Date.now(),
+      };
+      orphanDrafts.set(op.nodeId, draftStore[op.nodeId]);
+      persistDraftsNow();
+      toast(`离线改动未能同步：${msg.message || '服务器拒绝'}。原文已保留在本机草稿`, 'error', 5600);
+      renderActiveDoc();
+    }
+    finishSyncWait(tag, 'failed');
+  }
+}
+
+// 点行内徽章 / 顶栏计数：pending 触发回放；conflict 重新对齐一次并弹裁决窗
+function onSyncBadgeClick(op) {
+  if (!state.connected) {
+    toast('离线中：改动已存本机，恢复连接后自动对齐', '');
+    return;
+  }
+  if (offlineSync.flushing || offlineSync.current) {
+    toast('正在同步中，请稍候', '');
+    return;
+  }
+  if (op.status === 'conflict') {
+    syncOneOp(op, { wantModal: true }).then(() => renderActiveDoc());
+  } else {
+    flushOfflineQueue();
+  }
+}
+
+// 离线冲突裁决窗：三栏不变，文案明示"裁决前所有人看到的是线上版本"
+function openOfflineConflict(op) {
+  const c = op.conflict;
+  if (!c) return;
+  pendingConflict.current = { nodeId: op.nodeId, local: c.local, remote: c.remote, clientTag: op.id };
+  const cur = c.current || {};
+  const who = cur.author ? `${cur.author} 的 v${cur.version}` : '线上当前版本';
+  const when = cur.created_at ? `（${fmtTime(cur.created_at)}）` : '';
+  $('#conflict-title').textContent = '离线改动与线上版本冲突';
+  $('#conflict-sub').textContent =
+    `你断线期间改的这段，线上已有${who}${when}。在你裁决之前，所有人（含跟读）看到的都是线上版本，` +
+    '你的离线改动暂未生效；提交最终版本后，全员统一为最终内容。';
+  $('#conflict-local-label').textContent = '你的离线改动（暂未生效）';
+  $('#conflict-remote-label').textContent = `线上当前版本：${who}，裁决前以此为准`;
+  $('#conflict-local').value = c.local;
+  $('#conflict-remote').value = c.remote;
+  $('#conflict-final').value = c.remote;
+  $('#conflict-mask').classList.remove('hidden');
+}
+
+// 顶栏同步状态胶囊：有待同步/待裁决时可见，点击立即对齐
+function renderSyncState() {
+  const el = $('#sync-state');
+  if (!el) return;
+  const conflicts = offlineQueue.filter((o) => o.status === 'conflict').length;
+  const pending = offlineQueue.length - conflicts;
+  if (!offlineQueue.length) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.classList.remove('hidden');
+  el.classList.toggle('has-conflict', conflicts > 0);
+  if (conflicts) {
+    el.textContent = `⚠ ${conflicts} 段离线改动与线上冲突，待裁决`;
+    el.title = '这些段落在你断线期间被别人改过，当前以线上版本为准。点击逐段对齐并裁决。';
+  } else if (state.connected) {
+    el.textContent = `⏳ 正在同步 ${pending} 段离线改动…`;
+    el.title = '断线期间的改动正在与线上对齐。点击重试。';
+  } else {
+    el.textContent = `⏳ ${pending} 段离线改动待同步（已存本机）`;
+    el.title = '断线期间的改动已保存在本机，恢复连接后自动与线上对齐。';
+  }
+}
+
+
 const state = {
   ws: null,
   connected: false,
@@ -250,6 +566,10 @@ function connect(name) {
     setConn('offline');
     // 锁随旧连接在服务端释放；编辑会话与草稿保留，重连后重新占用
     edit.hasLock = false;
+    // 保存半途掉线：解开"保存中"的禁用态，草稿还在，重连后可重试
+    if (edit.saving) edit.saving = false;
+    // 重连拿到新快照后回放本机离线队列
+    offlineSync.armed = true;
     for (const v of state.views.values()) {
       v.locks.clear();
       v.lockInfo?.clear(); // 持有者信息一起清，否则断线窗口期徽章残留
@@ -272,6 +592,14 @@ function send(msg, { quiet = false } = {}) {
   return false;
 }
 
+// 结构改动（增/删/移动/挂跟读）不进离线队列：树版本乐观锁无法离线暂存，
+// 明确拦住并说明；段落正文编辑不受影响（自动存本机）。
+function requireOnline() {
+  if (state.connected) return true;
+  toast('离线中：增/删/移动/挂跟读这类结构改动不能暂存，请联网后再试（段落正文编辑会自动存本机）', 'error', 4600);
+  return false;
+}
+
 setInterval(() => {
   if (state.connected && state.ws && state.ws.readyState === WebSocket.OPEN) {
     send({ type: 'heartbeat' }, { quiet: true });
@@ -282,11 +610,17 @@ function setConn(status) {
   const dot = $('#conn-state');
   dot.className = `conn-dot ${status}`;
   dot.title = { online: '已连接', offline: '已断开（自动重连中）', connecting: '连接中' }[status] || status;
+  renderSyncState(); // 待同步徽章的文案随连接状态变化
 }
 
 /* ================= 消息分发 ================= */
 
 function handleMessage(msg) {
+  // 离线回放的回执（带 clientTag）走专用通道，不触碰交互式编辑会话
+  if (msg.clientTag) {
+    routeSyncMessage(msg);
+    return;
+  }
   switch (msg.type) {
     case 'hello':
       state.me = msg.user;
@@ -494,6 +828,7 @@ $('#newdoc-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const title = $('#newdoc-title').value.trim();
   if (!title) return;
+  if (!requireOnline()) return;
   send({ type: 'create_doc', title });
   $('#newdoc-mask').classList.add('hidden');
 });
@@ -560,6 +895,13 @@ function ingestSnapshot(msg) {
       edit.serverVersion = src.version;
       send({ type: 'lock', nodeId: edit.entryNodeId || edit.sourceId });
     }
+  }
+
+  // 重连后的第一份快照到了：本地已是线上真相，稍候把离线队列逐条对齐上去
+  // （等 400ms 是让其余标签页的快照一起落地，回放基于最新状态）
+  if (offlineSync.armed) {
+    offlineSync.armed = false;
+    setTimeout(() => flushOfflineQueue(), 400);
   }
 
   applyPendingFocus();
@@ -776,6 +1118,7 @@ function renderActiveDoc() {
   renderUsers();
   renderOutline();
   renderTimeBanner();
+  renderSyncState();
   $('#add-root').disabled = !state.activeDocId || timeTravel.active;
   updateEditingHint();
 }
@@ -912,6 +1255,28 @@ function renderNodeRow(view, node) {
     badge.textContent = '你正在编辑';
     meta.appendChild(badge);
   }
+  // 离线改动状态：待同步（黄）/ 与线上冲突待裁决（红，明示当前以线上为准）
+  const pendingOp = pendingOpFor(sourceId);
+  if (pendingOp && !(node.kind === 'mirror' && node.sourceDeleted)) {
+    const badge = document.createElement('span');
+    if (pendingOp.status === 'conflict') {
+      const cur = pendingOp.conflict?.current;
+      badge.className = 'sync-badge conflict';
+      badge.textContent = cur && cur.author
+        ? `⚠ 离线改动与线上冲突 · 当前以线上（${cur.author} 的 v${cur.version}）为准，点此裁决`
+        : '⚠ 离线改动与线上冲突 · 当前以线上为准，点此裁决';
+      badge.title = '你断线时改的这段与线上新版本撞上了，线上版本暂未被你覆盖。点击重新对齐并选择最终内容。';
+    } else {
+      badge.className = 'sync-badge pending';
+      badge.textContent = state.connected ? '⏳ 离线改动同步中…' : '⏳ 离线改动待同步（已存本机）';
+      badge.title = '断线时的改动已保存在本机，联网后自动与线上对齐';
+    }
+    badge.addEventListener('click', (e) => {
+      e.stopPropagation();
+      onSyncBadgeClick(pendingOp);
+    });
+    meta.appendChild(badge);
+  }
   el.appendChild(meta);
   return el;
 }
@@ -1015,9 +1380,21 @@ function beginEdit(nodeId) {
   edit.lockWanted = true;
   edit.saving = false;
 
+  const queuedOp = pendingOpFor(sourceId);
   const orphan = orphanDrafts.get(sourceId);
-  if (orphan) {
-    edit.draft = orphan;
+  if (queuedOp && offlineSync.current?.op !== queuedOp) {
+    // 这段有断线时存进本机的改动：折进编辑器，保存即按原基准版本与线上对齐
+    edit.draft = queuedOp.content;
+    edit.baseVersion = queuedOp.baseVersion ?? edit.baseVersion;
+    edit.restoreFromVersion = queuedOp.restoreFromVersion || null;
+    removeOp(queuedOp);
+    rememberDraft();
+    toast('已载入你断线时改的内容；保存时会与线上自动合并', 'ok', 3600);
+  } else if (orphan) {
+    edit.draft = orphan.content;
+    // 草稿基于的旧版本一并恢复：保存时三方合并的 base 才是真正的共同祖先
+    edit.baseVersion = orphan.baseVersion ?? edit.baseVersion;
+    edit.restoreFromVersion = orphan.restoreFromVersion || null;
     orphanDrafts.delete(sourceId);
     toast('已恢复你未保存的草稿，保存时会与服务器版本自动合并', 'ok', 3600);
   } else {
@@ -1030,7 +1407,8 @@ function beginEdit(nodeId) {
     .find(([, v]) => v.nodes.has(nodeId))?.[0];
   if (entryDocId && entryDocId !== state.activeDocId) activateTab(entryDocId);
   renderOutline();
-  send({ type: 'lock', nodeId }); // 服务器自行把跟读 id 解析成源锁
+  // 离线时静默：锁等重连后会自动重新申请（见 ingestSnapshot）
+  send({ type: 'lock', nodeId }, { quiet: !state.connected }); // 服务器自行把跟读 id 解析成源锁
   focusEditor(nodeId);
   startLockTimers(nodeId);
   updateEditingHint();
@@ -1069,7 +1447,8 @@ function renderEditor(node) {
   ta.addEventListener('input', () => {
     edit.draft = ta.value;
     edit.lastInputAt = Date.now();
-    if (edit.lockWanted && !edit.hasLock) {
+    rememberDraft(); // 未保存的草稿也落盘：断线/刷新不丢
+    if (state.connected && edit.lockWanted && !edit.hasLock) {
       send({ type: 'lock', nodeId: edit.entryNodeId || edit.sourceId });
     }
     edit.lockWanted = true;
@@ -1189,6 +1568,7 @@ function resetEditState() {
 }
 
 function stopEditing(reason) {
+  clearPersistedDraft(edit.sourceId);
   resetEditState();
   updateEditingHint();
   renderActiveDoc();
@@ -1198,6 +1578,7 @@ function stopEditing(reason) {
 function cancelEdit() {
   if (!edit.sourceId) return;
   if (edit.hasLock) send({ type: 'unlock', nodeId: edit.sourceId });
+  clearPersistedDraft(edit.sourceId);
   resetEditState();
   updateEditingHint();
   renderActiveDoc();
@@ -1205,6 +1586,11 @@ function cancelEdit() {
 
 function saveEdit() {
   if (!edit.sourceId || edit.saving) return;
+  // 断线：不进网络，写入本机离线队列（乐观显示 + 待同步徽章），联网后自动对齐
+  if (!state.connected) {
+    enqueueOfflineSave();
+    return;
+  }
   const payload = edit.restoreFromVersion
     ? {
         type: 'restore_save',
@@ -1220,7 +1606,8 @@ function saveEdit() {
       };
   const queued = send(payload);
   if (!queued) {
-    toast('当前离线，内容保留在编辑器里，恢复连接后再保存', 'error');
+    // 连接刚断的一瞬间：同样落入本机队列，不丢字
+    enqueueOfflineSave();
     return;
   }
   edit.saving = true;
@@ -1234,6 +1621,7 @@ function finishSave(sourceId) {
     return;
   }
   if (edit.hasLock) send({ type: 'unlock', nodeId: sourceId });
+  clearPersistedDraft(sourceId);
   resetEditState();
   updateEditingHint();
   renderActiveDoc();
@@ -1255,6 +1643,7 @@ function updateEditingHint() {
 
 function requestMove(nodeId, parentId, afterId) {
   if (parentId === nodeId) return;
+  if (!requireOnline()) return;
   const found = findRow(nodeId);
   if (!found) return;
   send({
@@ -1316,6 +1705,7 @@ function indent(nodeId, delta) {
 }
 
 function addNode(parentId, afterId) {
+  if (!requireOnline()) return;
   let docId = state.activeDocId;
   if (parentId) {
     const found = findRow(parentId);
@@ -1340,6 +1730,7 @@ function addNode(parentId, afterId) {
 $('#add-root').addEventListener('click', () => addNode(null, null));
 
 function deleteNode(nodeId) {
+  if (!requireOnline()) return;
   const found = findRow(nodeId);
   if (!found) return;
   if (found.node.kind === 'mirror') {
@@ -1366,6 +1757,7 @@ function countMirrors(sourceId) {
 }
 
 function removeMirror(nodeId) {
+  if (!requireOnline()) return;
   const found = findRow(nodeId);
   if (!found) return;
   if (!confirm('移除这处跟读？（源段落和其它大纲里的跟读不受影响）')) return;
@@ -1403,6 +1795,7 @@ $('#mirror-confirm').addEventListener('click', () => {
   const targetDocId = $('#mirror-doc-select').value;
   const sourceId = mirrorPicker.sourceId;
   if (!targetDocId || !sourceId) return;
+  if (!requireOnline()) return;
   // 需要目标文档当前 treeRev：未加载则让服务器预取快照后我们再发
   const doSend = () => {
     const view = viewOf(targetDocId);
@@ -1744,6 +2137,12 @@ async function continueFromPast(node) {
 
 function openConflict(msg) {
   pendingConflict.current = msg;
+  $('#conflict-title').textContent = '保存冲突：同一段被两个人改到了同一处';
+  $('#conflict-sub').textContent =
+    '你们基于同一版本改了重叠的内容，服务器没有替任何人覆盖。当前所有人看到的是「对方版本」；' +
+    '请选择最终保留的文本——其他人在此版本之后的其它不冲突改动不会丢失。';
+  $('#conflict-local-label').textContent = '你的版本';
+  $('#conflict-remote-label').textContent = '对方版本（当前服务器内容，裁决前以此为准）';
   $('#conflict-local').value = msg.local;
   $('#conflict-remote').value = msg.remote;
   $('#conflict-final').value = msg.remote;
@@ -1758,8 +2157,27 @@ $('#conflict-keep-remote').addEventListener('click', () => {
   $('#conflict-final').value = $('#conflict-remote').value;
 });
 $('#conflict-cancel').addEventListener('click', () => {
+  const c = pendingConflict.current;
   $('#conflict-mask').classList.add('hidden');
   pendingConflict.current = null;
+  if (c && c.clientTag) {
+    // 放弃同步这段离线改动：线上版本不动；原文存回本机草稿，不丢字
+    const op = offlineQueue.find((o) => o.id === c.clientTag);
+    if (op) {
+      removeOp(op);
+      draftStore[op.nodeId] = {
+        content: op.content,
+        baseVersion: op.baseVersion,
+        restoreFromVersion: op.restoreFromVersion || null,
+        at: Date.now(),
+      };
+      orphanDrafts.set(op.nodeId, draftStore[op.nodeId]);
+      persistDraftsNow();
+      toast('已放弃同步这段离线改动（线上版本不变）；原文已保留在本机草稿', '', 4600);
+    }
+    renderActiveDoc();
+    return;
+  }
   edit.saving = false;
   renderActiveDoc();
   if (edit.entryNodeId) focusEditor(edit.entryNodeId);
@@ -1768,26 +2186,44 @@ $('#conflict-save').addEventListener('click', () => {
   const c = pendingConflict.current;
   if (!c) return;
   const final = $('#conflict-final').value;
-  const ok = send({
+  const payload = {
     type: 'resolve',
     nodeId: c.nodeId, // 源 id
     content: final,
     keep: final === c.remote ? 'remote' : 'manual',
-  });
+  };
+  if (c.clientTag) payload.clientTag = c.clientTag; // 离线裁决：回执对号落队列
+  const ok = send(payload);
   if (!ok) return;
   $('#conflict-mask').classList.add('hidden');
   pendingConflict.current = null;
-  edit.saving = true;
-  send({ type: 'unlock', nodeId: c.nodeId });
+  if (!c.clientTag) {
+    edit.saving = true;
+    send({ type: 'unlock', nodeId: c.nodeId });
+  }
   toast('已提交最终版本', 'ok');
 });
 
 /* ================= 离开页面 ================= */
 
+// 顶栏同步状态胶囊：点击立即把本机离线改动对齐到线上（含重试冲突段）
+$('#sync-state').addEventListener('click', () => {
+  if (!offlineQueue.length) return;
+  if (!state.connected) {
+    toast('离线中：改动已存本机，恢复连接后自动对齐', '');
+    return;
+  }
+  flushOfflineQueue({ includeConflicts: true });
+});
+
 window.addEventListener('beforeunload', () => {
-  if (edit.sourceId && state.ws && state.ws.readyState === WebSocket.OPEN) {
-    try {
-      state.ws.send(JSON.stringify({ type: 'unlock', nodeId: edit.sourceId }));
-    } catch { /* ignore */ }
+  if (edit.sourceId) {
+    rememberDraft(); // 未保存的草稿落盘，下次打开还能找回
+    persistDraftsNow();
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try {
+        state.ws.send(JSON.stringify({ type: 'unlock', nodeId: edit.sourceId }));
+      } catch { /* ignore */ }
+    }
   }
 });
