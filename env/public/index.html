@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>协同大纲</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- 登录层 -->
+  <div id="login" class="login-mask">
+    <form id="login-form" class="login-card">
+      <h1>协同大纲</h1>
+      <p class="muted">输入你的名字进入文档，头像颜色由浏览器身份决定（刷新不变）。</p>
+      <input id="name-input" maxlength="40" placeholder="你的名字" autocomplete="off" required />
+      <button type="submit">进入文档</button>
+    </form>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="title-wrap">
+        <h2 id="doc-title">协同大纲</h2>
+        <span id="conn-state" class="conn-dot" title="连接状态"></span>
+      </div>
+      <div class="top-actions">
+        <span id="editing-hint" class="editing-hint hidden"></span>
+        <div id="users" class="users"></div>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="outline-wrap">
+        <div id="outline"></div>
+        <div class="root-actions">
+          <button id="add-root" class="ghost">＋ 添加顶层段落</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 历史抽屉 -->
+  <aside id="history-panel" class="history-panel hidden">
+    <div class="history-head">
+      <strong>段落历史</strong>
+      <button id="history-close" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div class="history-meta muted">
+      <span id="history-current"></span>
+    </div>
+    <div id="history-list" class="history-list"></div>
+  </aside>
+
+  <!-- 冲突解决弹窗 -->
+  <div id="conflict-mask" class="conflict-mask hidden">
+    <div class="conflict-card">
+      <h3>保存冲突：同一段被两个人改到了同一处</h3>
+      <p class="muted">
+        你们基于同一版本改了重叠的内容，服务器没有替任何人覆盖。请选择最终保留的文本——
+        其他人在此版本之后的<b>其它不冲突改动不会丢失</b>。
+      </p>
+      <div class="conflict-cols">
+        <label>你的版本
+          <textarea id="conflict-local" rows="8"></textarea>
+        </label>
+        <label>对方版本（当前服务器内容）
+          <textarea id="conflict-remote" rows="8"></textarea>
+        </label>
+      </div>
+      <label class="final-label">最终内容（可在任一侧基础上手动合并后粘贴/编辑）
+        <textarea id="conflict-final" rows="8"></textarea>
+      </label>
+      <div class="conflict-actions">
+        <button id="conflict-keep-local" class="ghost">用我的</button>
+        <button id="conflict-keep-remote" class="ghost">用对方的</button>
+        <button id="conflict-cancel" class="ghost">取消（放弃我的修改）</button>
+        <button id="conflict-save" class="primary">提交最终版本</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-host" class="toast-host"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

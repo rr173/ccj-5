@@ -1,0 +1,16 @@
+{
+  "name": "collab-outline",
+  "version": "1.0.0",
+  "description": "多人协同层级大纲：软锁占用、TTL 自动释放、三方合并收敛、段落级历史与回退",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "WS_PORT=3777 DB_FILE=./data/test.db node test/e2e.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

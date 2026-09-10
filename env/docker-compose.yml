@@ -1,0 +1,16 @@
+services:
+  outline:
+    build: .
+    image: collab-outline:latest
+    container_name: collab-outline
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # 编辑锁 TTL（毫秒）：心跳/连接断开后最长占用时间
+      LOCK_TTL_MS: "30000"
+    volumes:
+      - outline-data:/data
+
+volumes:
+  outline-data:
