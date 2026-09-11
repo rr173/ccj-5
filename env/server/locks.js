@@ -56,6 +56,12 @@ class LockManager {
     return true;
   }
 
+  // 段落被封口：不管锁在谁的连接上都释放（封口是硬边界，软占用不能挡），
+  // 返回是否真的释放过（调用方据此广播 unlocked）。
+  releaseBySource(nodeId) {
+    return this.locks.delete(nodeId);
+  }
+
   // 连接关闭：释放它持有的全部锁，返回被释放的 nodeId 列表
   releaseAll(connId) {
     const released = [];

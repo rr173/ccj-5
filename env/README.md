@@ -58,10 +58,11 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（16 + 6 + 11 + 11 + 8 + 7 + 9 + 10 个场景）+ 离线续改端到端 + 单元测试
+npm test                  # WebSocket 端到端（16 + 6 + 11 + 11 + 8 + 11 + 7 + 9 + 10 个场景）+ 离线续改端到端 + 单元测试
 node test/offline.e2e.test.js             # 离线续改：真实客户端 + 服务器停启 + 重连对齐全流程
 node test/excerpt.e2e.test.js             # 摘录：冻结/源改不跟随/陈旧徽章/对齐广播一致/CAS 并发/源删除墓碑/时间轴
 node test/comments.e2e.test.js            # 段落留言：全员可见/改字不丢/收掉广播一致/并发 CAS 收敛/取消反悔/边界
+node test/seals.e2e.test.js               # 段落封口：全员同一条/写路径硬拦/删父级拦截/并发理由 CAS/取消反悔/跟读投影/时间轴
 node test/presentation.e2e.test.js        # 讲解轮次：唯一讲解者/抢轮/两阶段交棒/取消反悔/断线结束
 node test/published.e2e.test.js           # 对外定稿：隔离/冻结/原子切换/并发 CAS/只读边界/跟读冻结
 node test/client.smoke.test.js            # jsdom 客户端冒烟：多文档 + 跟读全流程
@@ -130,6 +131,16 @@ clientTag 回执对号、未保存草稿落盘）。
     取消或关掉弹窗什么都不会发生，留言仍是上一份开着的样子。
   - 跟读行上的留言挂在这一处挂载行上（跨文档各自独立）；摘录是冻结副本，不能在上面留言（可去源段落）。
     离线时不能留言（入口会提示联网），避免"自己屏幕显示发了、其实谁都没收到"。
+- **段落封口（🔒 硬冻结）**：段落悬浮操作里点「🔒 封口」，写一句**封口理由**并确认后，所有正在看这份大纲
+  （含挂了这段**跟读**的其它大纲）的人立刻看到同一份已封：行首锁标记 + 红色封条 + 理由徽章。
+  - 封住后这段的**正文、改写提议、移动、删除全部硬锁**，谁都不能再把新字写进去（"删父级带走它"也整笔拒绝，不能绕过封口）；
+    讨论（留言）、挂跟读、做摘录、在其下加子级不受影响。服务器是唯一事实源，前端禁用只是提示，绕过前端同样被拒。
+  - 两个人几乎同时用**不同理由**封同一段：SQLite 事务串行裁决，只有先到者那条 `sealed` 被广播，
+    后到者收到 `seal_stale` 并自动收敛到**先封者那条理由**——不可能两边都显示封住、理由却对不上。
+  - 任何人都可以点行上的「🔓 重新打开」（可附一句打开说明，会留在时间轴），确认后全员看到同一份已打开，段落立即恢复可改。
+  - **反悔零成本**：打开封口弹窗/取消/点遮罩都不发任何请求，这段仍是上一份开着、能改的样子；只有点「确认封口」才发请求。
+  - 封口与打开都进时间轴（`seal`/`unseal`），整份回看时能重建"那一刻这段是封着还是开着、理由是什么"。
+  - 跟读行投影源段落的封口（源封跟读封、源开跟读开）；摘录本身就是冻结副本，不参与封口。封口不进离线队列，离线时入口直接拦下。
 - **对外定稿**：顶栏「📢 定稿」把**当前工作稿**冻结成对外版本（确认弹窗里可勾选"定稿后打开对外页"）。  - 外面的人打开 `http://<站点>/published/?doc=<文档id>`（默认文档可省略参数），是**纯只读页**：
     没有登录、没有任何编辑入口；服务器把这种连接标记为 `viewer`，只推送定稿快照，
     工作稿的正文、结构、锁、改写提议一律不扇出，viewer 发来的写消息也被服务器直接拒绝。
@@ -159,6 +170,7 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
                       ├── excerpt_states (摘录的 append-only 冻结副本：content + source_version)
                       ├── timeline   (全局 seq 时刻：结构+内容事件，含 excerpt_add/excerpt_align，整树可重建)
                       ├── comments   (段落留言：锚定 node_id 的 open/resolved 状态机，收掉靠条件 UPDATE CAS)
+                      ├── seal_events(段落封口：append-only sealed/unsealed 流，最新一条决定封/开，事务串行 CAS)
                       └── publications (pub_seq 定稿版本, base_seq CAS, timeline_seq, snapshot 冻结 JSON)
 ```
 
@@ -232,6 +244,29 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 - **离线不能留言**：讨论类数据没有"本地队列/合并"管线，离线时留言入口直接拦下并提示
   联网后再试，避免出现"我这边显示发了、其实谁都没收到"的假状态。
 
+### 段落封口协议要点
+
+- **append-only 状态流**：`seal_events(node_id, kind: sealed|unsealed, reason, author)`，
+  一段"当前封着/开着"= 该 node 最新一条事件。每次状态翻转同事务写一条时间轴
+  （`seal`/`unseal`），回看任意 seq 时重放 <= seq 的封口事件即可重建当时状态，
+  结果是 seq 的纯函数，所有人一致。
+- **封的是源普通段落**：跟读入口（mirror）在处理器里 `resolveEditable` 解析到源，
+  跟读行投影同一份封口（快照节点带 `seal`、增量扇出到 `audienceDocIds` 的全部宿主）；
+  摘录（excerpt）本身就是冻结副本，不能封也不显示封口。
+- **并发封口只可能一个理由赢**：两个几乎同时到达的 `seal` 在 SQLite 事务队列里串行，
+  后到者事务内已能读到先到者插入的 `sealed`，只返回 `already`（调用方发 `seal_stale`
+  并带回先封者整条事实），房间里只广播先到者那一条 `sealed`——与留言收掉、定稿 CAS
+  同一套机制，杜绝"两边都显示封住、理由却对不上"。`unseal` 同理（`already_open` 幂等，
+  回 `unseal_stale`，不广播第二条）。
+- **唯一事实是房间广播（含发起者的其他标签页），不另发个人 ack**：客户端不做乐观封口。
+- **硬边界在服务器事务里**：`saveContent` / `acceptSuggestion` / `createSuggestion` /
+  `moveNode` / `deleteNode` 全部检查封口状态；删除是整棵子树检查（`sealedIdsWithin`），
+  含封段则整笔 `sealed` 拒绝，不能用"删父级"绕过。`lock` 占用在封段上也不发放；
+  封口成功后原子释放该段现存软锁并广播 `unlocked(reason=sealed)`，正开着编辑器的人
+  收到广播即收起编辑会话。
+- **显式动作、反悔零成本**：封口理由必填；打开/取消/点遮罩不产生任何写入，
+  只有在确认弹窗点「确认封口」才发 `seal`。离线不封口（讨论/状态类操作同一条规则）。
+
 ### 讲解轮次协议要点
 
 - 状态只保存在服务器内存：`presentations: docId -> { leader, nodeId, offer }`，
@@ -295,6 +330,8 @@ add_excerpt {sourceId, docId, parentId, afterId, treeRev}  # 做摘录：冻一�
 excerpt_align {nodeId, baseSourceVersion}                  # 把摘录对齐到原文此刻（CAS）
 comment_add {nodeId, commentId, content}                   # 段落留言：落服务器后全员广播
 comment_resolve {commentId, content}                       # 收掉留言（CAS：先到者说法为准；确认后才发）
+seal {nodeId, reason}                                      # 封口（理由必填；确认弹窗点确认才发；事务串行 CAS）
+unseal {nodeId, reason?}                                   # 重新打开（说明可空；已开着则幂等 stale）
 ```
 
 `clientTag` 是离线回放队列给保存贴的回执标签（可省）；
@@ -304,7 +341,7 @@ comment_resolve {commentId, content}                       # 收掉留言（CAS�
 
 ```
 hello {user}
-snapshot {docId, title, treeRev, nodes[], locks[], presentation|null, users[], suggestions[], comments[], published?}
+snapshot {docId, title, treeRev, nodes[], locks[], presentation|null, users[], suggestions[], comments[], seals[], published?}
 presentation {docId, active, leader, nodeId, offer|null}   # 讲解轮次变化（active=false=本轮结束）
 presentation_denied {docId, leader, nodeId, message}
 published_state {docId, pubSeq, title, nodes|null, by?, createdAt?}  # 观看者初始；nodes=null=从未定稿
@@ -335,6 +372,11 @@ excerpt_source_deleted {sourceIds[]}                     # 源被删：摘录保
 comment_added {comment}                                  # 新留言（全房间同一条；comment 含 id/nodeId/content/author/status...）
 comment_resolved {comment}                               # 留言被收掉：全员同一份已收（含 resolvedContent/resolvedBy/resolvedAt）
 comment_resolve_stale {comment, message}                 # 并发收掉输了：只回后来者，带回先收那份，不再广播
+sealed {nodeId, docId, reason, by, createdAt, seal}      # 段落封口：源文档+全部跟读宿主同一条（含发起者其他标签页）
+unsealed {nodeId, docId, reason, by, createdAt, seal}    # 重新打开：全员同一份已打开
+seal_stale {nodeId, seal, message}                       # 并发封口输了：只回后来者，带回先封者理由，不广播第二条
+unseal_stale {nodeId, message}                           # 并发/重复打开：已经开着，收敛到同一份
+seal_denied {nodeId, seal?, message, clientTag?}         # 对封着的段做写操作（保存/改写/移动/删除/占锁）被服务器硬拦
 node_moved {nodeId, parentId, pos, treeRev}
 nodes_deleted {ids[], treeRev}
 tree_stale {treeRev}（后随 snapshot）

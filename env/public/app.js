@@ -283,10 +283,11 @@ function routeSyncMessage(msg) {
     finishSyncWait(tag, 'conflict');
     return;
   }
-  if (msg.type === 'error') {
+  if (msg.type === 'error' || msg.type === 'seal_denied') {
     if (op) {
       removeOp(op);
-      // 不丢字：同步失败的原文存回本机草稿（段落若还在，下次编辑可找回）
+      // 不丢字：同步失败的原文存回本机草稿（段落若还在，下次编辑可找回；
+      // 封口导致的失败，等段落重新打开后可再提交）
       draftStore[op.nodeId] = {
         content: op.content,
         baseVersion: op.baseVersion,
@@ -295,7 +296,12 @@ function routeSyncMessage(msg) {
       };
       orphanDrafts.set(op.nodeId, draftStore[op.nodeId]);
       persistDraftsNow();
-      toast(`离线改动未能同步：${msg.message || '服务器拒绝'}。原文已保留在本机草稿`, 'error', 5600);
+      toast(
+        msg.type === 'seal_denied'
+          ? `离线改动未能同步：${msg.message || '这段已封口'}。原文已保留在本机草稿，重新打开后可再提交`
+          : `离线改动未能同步：${msg.message || '服务器拒绝'}。原文已保留在本机草稿`,
+        'error', 5600,
+      );
       renderActiveDoc();
     }
     finishSyncWait(tag, 'failed');
@@ -405,6 +411,41 @@ const publishedByDoc = new Map();
 // value: { leader:{userId,userName,color}, nodeId, offer:{userId,userName}|null } | null
 const presentationByDoc = new Map();
 const presentFollowLock = { timer: 0 };
+
+/* ================= 段落封口（seal）：服务器唯一事实源 + CAS =================
+ *
+ * 封口是源段落级的"硬冻结"（跟读行投影源的封口；摘录本就是冻字、不参与）：
+ * - 封着的段不能写新字：编辑/提改写/收下改写/移动/删除（含"删父级带走它"）
+ *   都在服务器被硬拦，客户端同步禁用入口。
+ * - 封/开都以房间广播为唯一事实（含自己的其他标签页），绝不本地乐观落库：
+ *   sealed / unsealed 是全员同一条，理由逐字一致。
+ * - 两个几乎同时的封口在服务器事务里串行：后到者收 seal_stale + 先封者的理由，
+ *   本地收敛到同一份，不可能两边都显封、理由却不同。
+ * - 只有在确认弹窗点「确认封口」才发 seal；打开弹窗/取消/点遮罩不发任何消息，
+ *   段落还是上一份开着、能改的样子。
+ * 状态源：快照 seals + 增量 sealed/unsealed；key = 源段落 id，全局跨文档。
+ */
+const sealsByNode = new Map(); // sourceId -> seal event（{kind:'sealed', reason, author, createdAt}）
+
+function sealOfNode(node) {
+  if (!node || node.kind === 'excerpt') return null;
+  const sourceId = node.kind === 'mirror' ? node.mirrorOf : node.id;
+  const s = sealsByNode.get(sourceId);
+  return s && s.kind === 'sealed' ? s : null;
+}
+
+function applySeal(seal) {
+  if (!seal || !seal.nodeId) return;
+  sealsByNode.set(seal.nodeId, seal);
+  for (const { view, node } of rowsOfSource(seal.nodeId)) patchRow(view, node.id);
+  // 正在编辑这段（源行或任一读入口）：硬冻结必须立刻把编辑器收起来
+  if (edit.sourceId === seal.nodeId) stopEditing(`这段刚被 ${seal.author || '成员'} 封口，未保存的内容不会写入`);
+}
+
+function clearSeal(sourceId) {
+  sealsByNode.delete(sourceId);
+  for (const { view, node } of rowsOfSource(sourceId)) patchRow(view, node.id);
+}
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -935,6 +976,41 @@ function handleMessage(msg) {
       toast(msg.message || '这条刚被别人收掉，已显示同一份已收内容', 'error', 4200);
       break;
     }
+    case 'sealed':
+      applySeal(msg.seal);
+      if (sealDialog.nodeId === msg.nodeId) closeSealMask();
+      if (msg.by?.userId !== state.me?.userId) {
+        toast(`${msg.by?.userName || '有人'} 封住了一段：${msg.reason || ''}`.trim(), '', 4200);
+      }
+      break;
+    case 'unsealed':
+      clearSeal(msg.nodeId);
+      if (unsealDialog.nodeId === msg.nodeId) closeUnsealMask();
+      if (msg.by?.userId !== state.me?.userId) {
+        toast(`${msg.by?.userName || '有人'} 重新打开了一段`, 'ok', 3600);
+      }
+      break;
+    case 'seal_stale':
+      // 并发封口输了：弹窗关掉，理由以先封者那一份为准，全员收敛
+      $('#seal-confirm-btn')?.classList.remove('busy');
+      applySeal(msg.seal);
+      closeSealMask();
+      toast(msg.message || '这段刚被别人封住，已为你显示同一份封口理由', 'error', 4600);
+      break;
+    case 'unseal_stale':
+      $('#unseal-confirm-btn')?.classList.remove('busy');
+      clearSeal(msg.nodeId);
+      closeUnsealMask();
+      toast(msg.message || '这段已经被重新打开', 'ok', 3600);
+      break;
+    case 'seal_denied':
+      if (msg.seal) applySeal(msg.seal);
+      if (msg.seal && edit.sourceId === msg.nodeId) {
+        stopEditing(msg.message || '这段已封口，不能再写');
+      } else {
+        toast(msg.message || '这段已封口，不能再改', 'error', 4200);
+      }
+      break;
     case 'timeline':
       timelineCache.items = msg.items || [];
       timelineCache.latestSeq = msg.latestSeq || 0;
@@ -1209,6 +1285,22 @@ function ingestSnapshot(msg) {
   }
   // 留言按文档整份随快照下发（讨论量小，一份文档一条房间消息即可）
   state.commentsByDoc.set(docId, new Map((msg.comments || []).map((c) => [c.id, c])));
+
+  // 封口：以这份快照可见的源段落为准重建映射；快照里没下发的源保持不变
+  // （另一份文档的快照不会把它删掉），但本快照可见、当前已打开的段若不在 seals 里，
+  // 说明已被打开，清掉本地状态。
+  const visibleSealSources = new Set();
+  for (const node of nodes.values()) {
+    if (node.kind === 'excerpt') continue;
+    visibleSealSources.add(node.kind === 'mirror' ? node.mirrorOf : node.id);
+  }
+  const sealedNow = new Set((msg.seals || []).map((s) => {
+    sealsByNode.set(s.nodeId, s);
+    return s.nodeId;
+  }));
+  for (const sourceId of visibleSealSources) {
+    if (!sealedNow.has(sourceId)) sealsByNode.delete(sourceId);
+  }
 
   if (state.pendingNewDocId === docId) {
     // 新建文档的第一份快照：自动打开为标签页
@@ -1895,6 +1987,8 @@ function renderNodeRow(view, node) {
   if (lockedByOther) el.classList.add('locked-by-other');
   if (node.kind === 'mirror' && node.sourceDeleted) el.classList.add('source-gone');
   if (node.kind === 'excerpt' && node.stale) el.classList.add('excerpt-stale');
+  const seal = sealOfNode(node);
+  if (seal) el.classList.add('sealed-node');
 
   if (isEditingHere) {
     el.appendChild(renderEditor(node));
@@ -1921,6 +2015,7 @@ function renderNodeRow(view, node) {
   } else {
     content.className = 'node-content' +
       (node.kind === 'excerpt' ? ' excerpt-content' : '') +
+      (seal ? ' sealed-content' : '') +
       (node.content ? '' : ' placeholder');
     content.textContent = node.content || '（空段落）';
   }
@@ -1930,14 +2025,25 @@ function renderNodeRow(view, node) {
   actions.className = 'node-actions';
   if (node.kind === 'mirror') {
     if (!node.sourceDeleted) {
-      actions.append(
-        actionBtn('编辑', () => beginEdit(node.id)),
-        actionBtn('提改写', () => openSuggestionComposer(node.id)),
-        actionBtn('做摘录', () => createExcerpt(node.id)),
-        actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
-        actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
-        actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
-      );
+      if (seal) {
+        // 源段封着：跟读处也不能改正文/提改写；打开封口要去源大纲操作
+        actions.append(
+          actionBtn('🔓 重新打开（去源大纲）', () => jumpToSource(node, {}), false),
+          actionBtn('做摘录', () => createExcerpt(node.id)),
+          actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
+          actionBtn('↗ 去源大纲', () => jumpToSource(node, {})),
+          actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
+        );
+      } else {
+        actions.append(
+          actionBtn('编辑', () => beginEdit(node.id)),
+          actionBtn('提改写', () => openSuggestionComposer(node.id)),
+          actionBtn('做摘录', () => createExcerpt(node.id)),
+          actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
+          actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
+          actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
+        );
+      }
     } else {
       actions.append(actionBtn('↗ 打开源大纲', () => jumpToSource(node, {})));
     }
@@ -1968,17 +2074,32 @@ function renderNodeRow(view, node) {
       actionBtn('移除摘录', () => removeExcerpt(node.id), true),
     );
   } else {
-    actions.append(
-      actionBtn('编辑', () => beginEdit(node.id)),
-      actionBtn('提改写', () => openSuggestionComposer(node.id)),
-      actionBtn('做摘录', () => createExcerpt(node.id)),
-      actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
-      actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
-      actionBtn('＋子级', () => addNode(node.id, null)),
-      actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
-      actionBtn('挂跟读', () => openMirrorPicker(node)),
-      actionBtn('历史', () => openHistory(node.id)),
-    );
+    if (seal) {
+      // 封着：正文/改写/移动/删除全锁；只能打开封口、讨论、挂跟读、摘录、加子级、讲解/看历史
+      actions.append(
+        actionBtn('🔓 重新打开', () => openUnseal(node.id)),
+        actionBtn('做摘录', () => createExcerpt(node.id)),
+        actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
+        actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
+        actionBtn('＋子级', () => addNode(node.id, null)),
+        actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
+        actionBtn('挂跟读', () => openMirrorPicker(node)),
+        actionBtn('历史', () => openHistory(node.id)),
+      );
+    } else {
+      actions.append(
+        actionBtn('编辑', () => beginEdit(node.id)),
+        actionBtn('提改写', () => openSuggestionComposer(node.id)),
+        actionBtn('做摘录', () => createExcerpt(node.id)),
+        actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
+        actionBtn('🔒 封口', () => openSeal(node.id)),
+        actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
+        actionBtn('＋子级', () => addNode(node.id, null)),
+        actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
+        actionBtn('挂跟读', () => openMirrorPicker(node)),
+        actionBtn('历史', () => openHistory(node.id)),
+      );
+    }
   }
   row.appendChild(actions);
   el.appendChild(row);
@@ -2072,6 +2193,19 @@ function renderNodeRow(view, node) {
     const badge = document.createElement('span');
     badge.className = 'lock-badge';
     badge.textContent = '你正在编辑';
+    meta.appendChild(badge);
+  }
+  if (seal) {
+    const badge = document.createElement('span');
+    badge.className = 'seal-badge';
+    const who = seal.author || '成员';
+    const when = seal.createdAt ? ` · ${fmtTime(seal.createdAt)}` : '';
+    badge.innerHTML =
+      `<span class="seal-mark">🔒</span> 已封口（${escapeHtml(who)}${when}）` +
+      (seal.reason ? `：<span class="seal-reason"></span>` : '');
+    const reasonEl = badge.querySelector('.seal-reason');
+    if (reasonEl) reasonEl.textContent = seal.reason;
+    badge.title = '封口后这段不能再写新字（正文/移动/删除都锁定）；点「重新打开」恢复';
     meta.appendChild(badge);
   }
   if (isPresentationTarget(node.id)) {
@@ -2429,6 +2563,106 @@ $('#comment-resolve-btn').addEventListener('click', () => {
   }, 4000);
 });
 
+/* ---------- 封口 / 重新打开：显式确认 + CAS，反悔零成本 ---------- */
+
+const sealDialog = { nodeId: null, requestId: 0 };
+const unsealDialog = { nodeId: null, requestId: 0 };
+
+function openSeal(nodeId) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  if (sealOfNode(found.node)) {
+    toast('这段已经封着了', '');
+    return;
+  }
+  const quote = String(found.node.content || '空段落').replace(/\s+/g, ' ').slice(0, 80);
+  $('#seal-quote').textContent = quote;
+  $('#seal-reason').value = '';
+  $('#seal-confirm-btn').classList.remove('busy');
+  sealDialog.nodeId = sourceIdOf(found.node);
+  sealDialog.requestId++;
+  $('#seal-mask').classList.remove('hidden');
+  $('#seal-reason').focus();
+}
+
+function closeSealMask() {
+  $('#seal-mask').classList.add('hidden');
+  $('#seal-confirm-btn')?.classList.remove('busy');
+  sealDialog.nodeId = null;
+  sealDialog.requestId++;
+}
+
+$('#seal-cancel').addEventListener('click', () => {
+  // 反悔只发生在点确认之前：到这里什么请求都没发，段落还是上一份开着、能改的样子
+  closeSealMask();
+});
+$('#seal-mask').addEventListener('click', (e) => {
+  if (e.target === $('#seal-mask')) closeSealMask();
+});
+$('#seal-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const nodeId = sealDialog.nodeId;
+  if (!nodeId) return;
+  if (!requireOnline()) return;
+  const reason = $('#seal-reason').value.trim();
+  if (!reason) {
+    toast('封口要写一句理由：让看的人知道这段为什么不能再改', 'error');
+    $('#seal-reason').focus();
+    return;
+  }
+  // 到这里才真正发 seal。服务器事务串行裁决：先到者的理由是全员看到的唯一一份，
+  // 后到者收 seal_stale 并收敛到同一份，绝不两边都显封、理由却不同。
+  $('#seal-confirm-btn').classList.add('busy');
+  send({ type: 'seal', nodeId, reason });
+  setTimeout(() => $('#seal-confirm-btn')?.classList.remove('busy'), 4000);
+});
+
+function openUnseal(nodeId) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  const seal = sealOfNode(found.node);
+  if (!seal) {
+    toast('这段现在就是开着的', '');
+    return;
+  }
+  unsealDialog.nodeId = sourceIdOf(found.node);
+  unsealDialog.requestId++;
+  $('#unseal-quote').textContent = String(found.node.content || '空段落').replace(/\s+/g, ' ').slice(0, 80);
+  const why = $('#unseal-why');
+  why.textContent =
+    `由 ${seal.author || '成员'} 封口${seal.createdAt ? '（' + fmtTime(seal.createdAt) + '）' : ''}` +
+    (seal.reason ? `，理由：${seal.reason}` : '');
+  $('#unseal-reason').value = '';
+  $('#unseal-confirm-btn').classList.remove('busy');
+  $('#unseal-mask').classList.remove('hidden');
+  $('#unseal-reason').focus();
+}
+
+function closeUnsealMask() {
+  $('#unseal-mask').classList.add('hidden');
+  $('#unseal-confirm-btn')?.classList.remove('busy');
+  unsealDialog.nodeId = null;
+  unsealDialog.requestId++;
+}
+
+$('#unseal-cancel').addEventListener('click', closeUnsealMask);
+$('#unseal-mask').addEventListener('click', (e) => {
+  if (e.target === $('#unseal-mask')) closeUnsealMask();
+});
+$('#unseal-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const nodeId = unsealDialog.nodeId;
+  if (!nodeId) return;
+  if (!requireOnline()) return;
+  $('#unseal-confirm-btn').classList.add('busy');
+  send({ type: 'unseal', nodeId, reason: $('#unseal-reason').value.trim() });
+  setTimeout(() => $('#unseal-confirm-btn')?.classList.remove('busy'), 4000);
+});
+
 /* 局部补丁：源段落变了，把所有挂载点（源行 + 跟读行）的 DOM 换掉 */
 function patchSource(sourceId) {
   for (const { view, node } of rowsOfSource(sourceId)) patchRow(view, node.id);
@@ -2504,6 +2738,10 @@ function beginEdit(nodeId) {
   }
   if (node.kind === 'excerpt') {
     toast('摘录是冻住的副本，不能直接改；点「对齐到原文」更新它，或点「去源大纲」改原文', 'error', 4200);
+    return;
+  }
+  if (sealOfNode(node)) {
+    toast('这段已封口，不能再写新字；需要改请先点「重新打开」', 'error', 4200);
     return;
   }
   const sourceId = sourceIdOf(node);
@@ -2812,6 +3050,10 @@ function requestMove(nodeId, parentId, afterId) {
   if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
+  if (sealOfNode(found.node)) {
+    toast('这段已封口，层级位置也不能动；重新打开后再调整', 'error', 3600);
+    return;
+  }
   send({
     type: 'move',
     nodeId,
@@ -2911,6 +3153,10 @@ function deleteNode(nodeId) {
   }
   if (found.node.kind === 'excerpt') {
     removeExcerpt(nodeId);
+    return;
+  }
+  if (sealOfNode(found.node)) {
+    toast('这段已封口，不能删除；请先重新打开', 'error', 3600);
     return;
   }
   const mirrorCount = countMirrors(nodeId);
@@ -3187,6 +3433,10 @@ function openSuggestionComposer(nodeId) {
   if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
+  if (sealOfNode(found.node)) {
+    toast('这段已封口，不再收改写提议；重新打开后再提', 'error', 4200);
+    return;
+  }
   const sourceId = sourceIdOf(found.node);
   const sourceRow = rowsOfSource(sourceId).find((r) => r.node.kind !== 'mirror')?.node || found.node;
   suggestionComposer.sourceId = sourceId;
@@ -3234,6 +3484,10 @@ function withdrawSuggestion(proposal) {
 function acceptSuggestion(proposal) {
   if (!requireOnline()) return;
   if (!requirePresenterForEdit()) return;
+  if (sealsByNode.get(proposal.nodeId)?.kind === 'sealed') {
+    toast('这段在改写待决期间被封口了；重新打开后才能收下这版', 'error', 4200);
+    return;
+  }
   if (!confirm('收下这版改写？收下后正文和所有跟读会立即统一为这一版。')) return;
   send({ type: 'suggestion_accept', suggestionId: proposal.id });
 }
@@ -3286,6 +3540,10 @@ function restoreRevision(nodeId, rev) {
   const found = findRow(nodeId);
   if (!found) {
     toast('该段落在当前已不存在（可能已被删除），无法从旧时刻接着改', 'error');
+    return;
+  }
+  if (sealOfNode(found.node)) {
+    toast('这段当前已封口，不能从旧版本续写；请先重新打开', 'error', 4200);
     return;
   }
   if (edit.sourceId && edit.sourceId !== nodeId) {
@@ -3344,6 +3602,7 @@ $('#tt-exit').addEventListener('click', exitTimeTravel);
 const TL_KIND_LABEL = {
   add: '新增', content: '修改', move: '移动', delete: '删除',
   mirror_add: '跟读', excerpt_add: '摘录', excerpt_align: '摘录对齐',
+  seal: '封口', unseal: '打开',
 };
 
 function drawTimeline() {
@@ -3488,10 +3747,12 @@ function renderTimeNode(tt, id) {
 }
 
 function renderTimeRow(node) {
+  const sealAt = node.seal || null;
   const el = document.createElement('div');
   el.className = 'node tt-node' +
     (node.kind === 'mirror' ? ' mirror-node' : '') +
-    (node.kind === 'excerpt' ? ' excerpt-node' : '');
+    (node.kind === 'excerpt' ? ' excerpt-node' : '') +
+    (sealAt ? ' sealed-node sealed-tt' : '');
   if ((node.kind === 'mirror' || node.kind === 'excerpt') && node.sourceDeleted) {
     el.classList.add('source-gone');
   }
@@ -3570,6 +3831,12 @@ function renderTimeRow(node) {
     tag.className = 'muted';
     tag.textContent = `${node.author} · ${fmtTime(node.updatedAt)}`;
     meta.appendChild(tag);
+  }
+  if (sealAt) {
+    const badge = document.createElement('span');
+    badge.className = 'seal-badge';
+    badge.textContent = `🔒 该时刻已封口${sealAt.reason ? '：' + sealAt.reason : ''}`;
+    meta.appendChild(badge);
   }
   el.appendChild(meta);
   return el;

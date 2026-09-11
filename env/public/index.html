@@ -219,6 +219,53 @@
     </div>
   </div>
 
+  <!-- 封口确认弹窗：不点确认绝不发 seal，反悔零成本 -->
+  <div id="seal-mask" class="conflict-mask hidden">
+    <form id="seal-form" class="newdoc-card">
+      <h3>封住这一段？</h3>
+      <p class="muted">
+        封口后，所有正在看这份大纲（含挂了这段跟读的其它大纲）的人立刻看到<b>同一份已封</b>和你写的理由：
+        这段的正文、改写、移动、删除都会锁住，谁都不能再把新字写进去。需要改动时，任何人都可以点「重新打开」。
+      </p>
+      <label class="final-label">要封住的内容
+        <textarea id="seal-quote" rows="3" readonly></textarea>
+      </label>
+      <label class="final-label">封口理由（必填）
+        <textarea id="seal-reason" rows="2" maxlength="2000" placeholder="例如：已定稿，改动请先在群里对齐 / 等待法务确认" required></textarea>
+      </label>
+      <p class="muted" id="seal-cas-hint">
+        如果你确认期间已被别人封住，弹窗会自动关闭并显示<b>先封者那条理由</b>——不会两边都封住、理由却对不上。
+        取消或关掉窗口什么都不会发生，这段仍是上一份开着、能改的样子。
+      </p>
+      <div class="conflict-actions">
+        <button type="button" id="seal-cancel" class="ghost">取消（这段保持开着）</button>
+        <button type="submit" id="seal-confirm-btn" class="primary">确认封口</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 重新打开确认弹窗 -->
+  <div id="unseal-mask" class="conflict-mask hidden">
+    <form id="unseal-form" class="newdoc-card">
+      <h3>重新打开这一段？</h3>
+      <p class="muted" id="unseal-why"></p>
+      <p class="muted">
+        打开后所有正在看的人立刻看到<b>同一份已打开</b>，这段恢复可改。可以附一句打开说明（会留在时间轴里，可留空）。
+        若你确认期间已被别人先打开，弹窗会自动关闭，大家看到的都是同一份开着的状态。
+      </p>
+      <label class="final-label">要打开的内容
+        <textarea id="unseal-quote" rows="3" readonly></textarea>
+      </label>
+      <label class="final-label">打开说明（可留空）
+        <textarea id="unseal-reason" rows="2" maxlength="2000" placeholder="例如：法务已确认，可以继续改"></textarea>
+      </label>
+      <div class="conflict-actions">
+        <button type="button" id="unseal-cancel" class="ghost">取消（继续封着）</button>
+        <button type="submit" id="unseal-confirm-btn" class="primary">确认打开</button>
+      </div>
+    </form>
+  </div>
+
   <!-- 定稿确认弹窗：不点确认绝不发 publish，反悔成本为零 -->
   <div id="publish-mask" class="conflict-mask hidden">
     <form id="publish-form" class="newdoc-card">

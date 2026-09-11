@@ -229,6 +229,7 @@ function snapshotMessage(docId) {
       : null,
     suggestions: relevantSuggestions(snap.nodes),
     comments: store.listCommentsForDoc(db, docId),
+    seals: snap.seals || [],
     users: presenceList(docId),
     published: pub
       ? {
@@ -471,6 +472,15 @@ function handleLock(peer, msg) {
     return;
   }
   const sourceId = resolved.source.id;
+  if (store.isSealed(db, sourceId)) {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId: sourceId,
+      seal: store.latestSealEvent(db, sourceId),
+      message: '这段已封口，不能再编辑；需要改请先请人重新打开',
+    });
+    return;
+  }
   const prev = locks.locks.get(sourceId);
   const held = locks.acquire(sourceId, peer.user, peer.connId);
   if (held) {
@@ -710,6 +720,15 @@ function handleSuggestionAdd(peer, msg) {
     send(peer, { type: 'error', nodeId: source.id, message: '缺少改写所基于的版本号' });
     return;
   }
+  if (store.isSealed(db, source.id)) {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId: source.id,
+      seal: store.latestSealEvent(db, source.id),
+      message: '这段已封口，连改写提议也不收了；需要改请先请人重新打开',
+    });
+    return;
+  }
 
   const id = crypto.randomUUID();
   const result = store.createSuggestion(db, {
@@ -793,6 +812,15 @@ function handleSuggestionAccept(peer, msg) {
     return;
   }
   const nodeId = result.suggestion?.nodeId;
+  if (result.status === 'sealed') {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId,
+      seal: store.latestSealEvent(db, nodeId),
+      message: '这段在改写待决期间被封口了，这版改写没有收入正文；重新打开后可再收下',
+    });
+    return;
+  }
   if (result.status === 'not_pending') {
     send(peer, {
       type: 'suggestion_stale',
@@ -910,6 +938,16 @@ function handleSave(peer, msg) {
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
+  if (store.isSealed(db, nodeId)) {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId,
+      seal: store.latestSealEvent(db, nodeId),
+      message: '这段已封口，不能再写新字；需要改动请先请人重新打开',
+      clientTag,
+    });
+    return;
+  }
   const latest = store.getLatestRevision(db, nodeId);
 
   // 版本一致：直接落库
@@ -1037,6 +1075,16 @@ function handleRestoreSave(peer, msg) {
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
+  if (store.isSealed(db, nodeId)) {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId,
+      seal: store.latestSealEvent(db, nodeId),
+      message: '这段已封口，不能基于历史版本续写；请先请人重新打开',
+      clientTag,
+    });
+    return;
+  }
   const latest = store.getLatestRevision(db, nodeId);
   const baseRev = store.getRevisionByVersion(db, nodeId, restoreVersion);
   if (!baseRev) {
@@ -1185,6 +1233,105 @@ function handleCommentResolve(peer, msg) {
   sendToDoc(result.comment.docId, { type: 'comment_resolved', comment: result.comment });
 }
 
+// ---------- 段落封口：服务器唯一事实源；封/开都是 CAS ----------
+//
+// 关键语义（与留言收掉、定稿、摘录对齐同一套收敛思路）：
+// - 封的是源普通段落：跟读入口解析到源（resolveEditable），跟读行投影同一份封口；
+//   摘录是冻结副本，不能封。源文档 + 所有挂了跟读的文档收到同一条广播。
+// - 广播是房间内唯一事实（含发起者的其他标签页），不另发个人 ack：
+//   所有正在看的人必然看到同一份"封着/开着"和同一条理由。
+// - 两个几乎同时到达、理由不同的 seal 在 SQLite 事务队列里串行：
+//   先到者插入 sealed 并广播；后到者事务里读到已封，只拿 seal_stale + 先到者理由，
+//   绝不可能"两边都显示封住，理由却对不上"。unseal 同理（already_open 幂等）。
+// - 只有显式在确认弹窗里点「确认封口」才发 seal；打开弹窗/取消/点遮罩不发任何消息，
+//   段落仍是上一份开着、能改的样子。
+// - 封口成功后释放该段的编辑软锁并广播 unlocked：别人占着的锁只是"正在编辑"提示，
+//   封口是硬边界，后续保存一律被写路径的 isSealed 事务检查拒绝。
+function sealMessage(seal) {
+  return {
+    type: seal.kind === 'sealed' ? 'sealed' : 'unsealed',
+    nodeId: seal.nodeId,
+    docId: seal.docId,
+    reason: seal.reason || '',
+    by: { userId: seal.authorId, userName: seal.author },
+    createdAt: seal.createdAt,
+    seal,
+  };
+}
+
+function handleSeal(peer, msg) {
+  const entryId = String(msg.nodeId || '');
+  const resolved = resolveEditable(entryId);
+  if (resolved.error) {
+    send(peer, { type: 'error', nodeId: entryId, message: resolved.error });
+    return;
+  }
+  const source = resolved.source;
+  if (!denySourceWriteWhileFollowing(peer, source.id)) return;
+  const reason = String(msg.reason ?? '').trim().slice(0, 2000);
+  if (!reason) {
+    send(peer, { type: 'error', nodeId: source.id, message: '封口要写一句理由：让看的人知道这段为什么不能再改' });
+    return;
+  }
+  const result = store.sealNode(db, {
+    nodeId: source.id,
+    reason,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'invalid') {
+    send(peer, { type: 'error', nodeId: source.id, message: '该段落不存在或不能封口' });
+    return;
+  }
+  if (result.status === 'already') {
+    // 并发输了：绝不广播第二份 sealed。把先封者那条事实（含理由）带给后来者。
+    send(peer, {
+      type: 'seal_stale',
+      nodeId: source.id,
+      seal: result.seal,
+      message: `这段刚被 ${result.seal.author || '另一位成员'} 封住了，已为你显示同一份封口理由`,
+    });
+    return;
+  }
+  // 封口成功：全房间（含发起者的其他标签页）同一条；再原子释放该段编辑锁
+  sendToDocs(audienceDocIds(source.id), sealMessage(result.seal));
+  if (locks.releaseBySource(source.id)) {
+    sendToDocs(audienceDocIds(source.id), { type: 'unlocked', nodeId: source.id, reason: 'sealed' });
+  }
+}
+
+function handleUnseal(peer, msg) {
+  const entryId = String(msg.nodeId || '');
+  const resolved = resolveEditable(entryId);
+  if (resolved.error) {
+    send(peer, { type: 'error', nodeId: entryId, message: resolved.error });
+    return;
+  }
+  const source = resolved.source;
+  if (!denySourceWriteWhileFollowing(peer, source.id)) return;
+  const note = String(msg.reason ?? '').trim().slice(0, 2000);
+  const result = store.unsealNode(db, {
+    nodeId: source.id,
+    reason: note,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'invalid') {
+    send(peer, { type: 'error', nodeId: source.id, message: '该段落不存在' });
+    return;
+  }
+  if (result.status === 'already_open') {
+    // 并发：别人先打开了。把"已经开着"的事实收敛给后来者，不再广播第二条。
+    send(peer, {
+      type: 'unseal_stale',
+      nodeId: source.id,
+      message: '这段已经被重新打开了，所有人看到的都是同一份开着的状态',
+    });
+    return;
+  }
+  sendToDocs(audienceDocIds(source.id), sealMessage(result.seal));
+}
+
 // ---------- 整份时间轴：按时刻回看整棵树的层级与正文 ----------
 
 function handleTimeline(peer) {
@@ -1233,6 +1380,16 @@ function handleResolve(peer, msg) {
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
+  if (store.isSealed(db, nodeId)) {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId,
+      seal: store.latestSealEvent(db, nodeId),
+      message: '冲突裁决还没提交，这段已被封口，不能写入；请先请人重新打开',
+      clientTag,
+    });
+    return;
+  }
   const latest = store.getLatestRevision(db, nodeId);
   const result = store.saveContent(db, {
     nodeId,
@@ -1571,6 +1728,15 @@ function handleMove(peer, msg) {
     sendStale(peer, doc);
     return;
   }
+  if (result.status === 'sealed') {
+    send(peer, {
+      type: 'seal_denied',
+      nodeId,
+      seal: store.latestSealEvent(db, nodeId),
+      message: '这段已封口，层级位置也不能动；重新打开后再调整',
+    });
+    return;
+  }
   if (result.status !== 'moved') return;
   sendToDoc(doc.id, {
     type: 'node_moved', docId: doc.id, nodeId, parentId, pos, treeRev: result.treeRev,
@@ -1632,6 +1798,19 @@ function handleDelete(peer, msg) {
     nodeId, treeRev: Number(msg.treeRev),
     userId: peer.user.userId, userName: peer.user.userName,
   });
+  if (result.status === 'sealed') {
+    // 待删子树里有封着的段（也可能就是它自己）：整笔不删，把第一段给回去
+    const firstId = result.sealedIds[0];
+    send(peer, {
+      type: 'seal_denied',
+      nodeId: firstId,
+      seal: store.latestSealEvent(db, firstId),
+      message: firstId === nodeId
+        ? '这段已封口，不能删除；重新打开后再删'
+        : '要删的子树里有已封口的段落，整笔删除已取消（不能用"删父级"绕过封口）',
+    });
+    return;
+  }
   if (result.status !== 'deleted') return;
 
   // 释放被删子树上所有编辑锁（锁以源 id 为键），并通知各房间
@@ -1731,6 +1910,8 @@ wss.on('connection', (ws) => {
         case 'history': handleHistory(peer, msg); break;
         case 'comment_add': handleCommentAdd(peer, msg); break;
         case 'comment_resolve': handleCommentResolve(peer, msg); break;
+        case 'seal': handleSeal(peer, msg); break;
+        case 'unseal': handleUnseal(peer, msg); break;
         case 'timeline': handleTimeline(peer, msg); break;
         case 'snapshot_at': handleSnapshotAt(peer, msg); break;
         case 'add': handleAdd(peer, msg); break;

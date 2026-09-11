@@ -120,6 +120,32 @@ button.danger { color: var(--danger); border-color: #f3c0c0; }
   padding: 1px 10px; font-size: 11px;
 }
 
+/* 封口段落：一眼看得出"这段已经封住、不能再写新字" */
+.node.sealed-node {
+  border-left: 3px solid #b91c1c;
+  background: #fdf7f6;
+}
+.node.sealed-node .node-content.sealed-content {
+  border-left: 2px solid #e2b4b0;
+  padding-left: 10px;
+  color: #5b4b49;
+  white-space: pre-wrap;
+}
+.node.sealed-node .node-content.sealed-content::before {
+  content: '🔒 ';
+}
+.seal-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: #991b1b; background: #fdecea;
+  border: 1px solid #f3c6c2; border-radius: 999px;
+  padding: 1px 10px; font-size: 11px; font-weight: 600;
+  max-width: 100%;
+}
+.seal-badge .seal-reason { font-weight: 400; }
+.seal-mark { filter: saturate(.8); }
+#seal-confirm-btn.busy, #unseal-confirm-btn.busy { opacity: .6; pointer-events: none; }
+.tt-node.sealed-tt .node-content::before { content: '🔒 '; }
+
 /* 离线同步状态：顶栏胶囊 + 段落徽章 */
 .sync-state {
   font-size: 12px; color: var(--warn);

@@ -151,6 +151,26 @@ function init(dbFile) {
     );
     CREATE INDEX IF NOT EXISTS idx_comments_doc ON comments(doc_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_comments_node ON comments(node_id, created_at);
+
+    -- 段落封口：append-only 状态流。每一段"当前是否封着"= 该 node 最新一条事件：
+    -- kind='sealed' 即封着（带唯一一份封口理由），kind='unsealed' 即开着。
+    -- 封口是 open ⇄ sealed 可反复翻转的状态机，收敛点就在这张表的事务串行上：
+    -- 两条几乎同时到达的 seal 在同一 SQLite 事务队列里排队，后到者事务内已能读到
+    -- 先到者插入的 sealed，只拿到 already（连同先到者的理由）——调用方只广播
+    -- 先到者那一条 sealed，不可能"两边都显示封住，理由却对不上"。
+    -- 封的永远是源普通段落（跟读入口在处理器里解析到源，与编辑锁一致）；
+    -- 跟读行投影源的封口状态，摘录是冻结副本、不参与封口。
+    CREATE TABLE IF NOT EXISTS seal_events (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      node_id    TEXT NOT NULL,          -- 永远是源普通节点 id
+      doc_id     TEXT NOT NULL,          -- 源所在文档（决定时间轴归属/扇出辅助）
+      kind       TEXT NOT NULL,          -- sealed | unsealed
+      reason     TEXT NOT NULL DEFAULT '',-- sealed：封口理由；unsealed：打开说明（可空）
+      author_id  TEXT NOT NULL DEFAULT '',
+      author     TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_seal_node ON seal_events(node_id, id);
   `);
 
   // 旧库迁移：补 mirror_of / excerpt_of 列（必须先于该列的索引创建）
@@ -427,7 +447,28 @@ function getSnapshot(db, docId) {
     own.push(node);
   }
 
-  return { doc, nodes: own };
+  // 当前封着的段：只对本文档可见的源段落（含被跟读挂进来的源）下发。
+  // 封的是源：普通行直接带 sealed；跟读行由客户端按 mirrorOf 查这份映射显示同一封口。
+  const seals = listCurrentSeals(db, [...visibleSourceIdsOfRows(own)]);
+  const sealByNode = new Map(seals.map((s) => [s.nodeId, s]));
+  for (const n of own) {
+    if (n.kind === 'excerpt') continue; // 摘录是冻结副本，不显示/不参与封口
+    const sourceId = n.kind === 'mirror' ? n.mirrorOf : n.id;
+    const seal = sealByNode.get(sourceId);
+    if (seal) n.seal = seal;
+  }
+
+  return { doc, nodes: own, seals };
+}
+
+// 快照节点里能看到的全部源 id（普通行自己 + 跟读源；不含摘录源——摘录不投影封口）
+function visibleSourceIdsOfRows(rows) {
+  const ids = new Set();
+  for (const n of rows) {
+    if (n.kind === 'mirror') ids.add(n.mirrorOf);
+    else if (n.kind !== 'excerpt') ids.add(n.id);
+  }
+  return [...ids];
 }
 
 function getNode(db, nodeId) {
@@ -580,6 +621,7 @@ function createSuggestion(db, { id, nodeId, content, baseVersion, userId, userNa
   return db.transaction(() => {
     const node = getNode(db, nodeId);
     if (!node || node.deleted || node.mirror_of) return { status: 'missing' };
+    if (isSealed(db, nodeId)) return { status: 'sealed' };
     const latest = getLatestRevision(db, nodeId);
     if (!latest) return { status: 'missing' };
     if (!Number.isInteger(baseVersion) || baseVersion < 1) return { status: 'bad_base' };
@@ -619,6 +661,7 @@ function acceptSuggestion(db, { suggestionId, userId, userName }) {
     const suggestion = normalizeSuggestion(srow);
     const node = getNode(db, suggestion.nodeId);
     if (!node || node.deleted || node.mirror_of) return { status: 'missing', suggestion };
+    if (isSealed(db, suggestion.nodeId)) return { status: 'sealed', suggestion };
     if (suggestion.status === 'accepted' || suggestion.status === 'withdrawn') {
       return { status: 'not_pending', suggestion };
     }
@@ -699,6 +742,7 @@ function saveContent(db, { nodeId, content, expectedVersion, userId, userName, n
   return db.transaction(() => {
     const node = getNode(db, nodeId);
     if (!node || node.deleted || node.mirror_of) return { status: 'missing' };
+    if (isSealed(db, nodeId)) return { status: 'sealed' };
     const latest = getLatestRevision(db, nodeId);
     if (!latest) return { status: 'missing' };
 
@@ -866,6 +910,11 @@ function moveNode(db, { nodeId, parentId, pos, treeRev, userId = '', userName = 
   return db.transaction(() => {
     const node = getNode(db, nodeId);
     if (!node) return { status: 'missing' };
+    // 封着的普通段不能被移动：封口连层级位置一起冻结。跟读/摘录挂载行是宿主
+    // 文档自己的本地结构（移动/移除不改变封着的源），不拦。
+    if (!node.mirror_of && !node.excerpt_of && isSealed(db, nodeId)) {
+      return { status: 'sealed' };
+    }
     const doc = getDoc(db, node.doc_id);
     // treeRev 为乐观锁：基于过期树结构的操作拒绝
     if (treeRev !== undefined && treeRev !== doc.tree_rev) {
@@ -914,6 +963,10 @@ function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
       ids.push(id);
       for (const child of byParent.get(id) || []) stack.push(child);
     }
+    // 封口连删除一起封：整棵待删子树里只要有封着的普通段，整笔拒绝
+    // （不能让"删父级"绕过段落自己的封口）。跟读/摘录挂载行的删除不经过这里的子树拦截。
+    const sealedIds = sealedIdsWithin(db, ids);
+    if (sealedIds.length) return { status: 'sealed', sealedIds };
     const stmt = db.prepare('UPDATE nodes SET deleted = 1 WHERE id = ?');
     for (const id of ids) stmt.run(id);
     const supersededSuggestionIds = [];
@@ -970,6 +1023,8 @@ function getTimeline(db, limit = 300) {
     else if (r.kind === 'mirror_add') summary = '挂载跟读';
     else if (r.kind === 'excerpt_add') summary = '做了一处摘录（冻结当前正文）';
     else if (r.kind === 'excerpt_align') summary = '摘录对齐到原文最新版本';
+    else if (r.kind === 'seal') summary = r.note || '封口段落';
+    else if (r.kind === 'unseal') summary = r.note || '重新打开段落';
     else if (r.kind === 'move') summary = '移动段落 / 调整层级';
     else if (r.kind === 'delete') {
       summary = `删除段落（共 ${(JSON.parse(r.deletedIds || '[]')).length} 段）`;
@@ -1056,13 +1111,36 @@ function getSnapshotAt(db, docId, seq) {
     db.prepare('SELECT id FROM nodes WHERE deleted = 0').all().map((r) => r.id),
   );
 
+  // 3.5) 封口状态在 at 时刻的重建：<= at 的 seal/unseal 事件里每段最后一条决定。
+  // 结果是 seq 的纯函数，所有人回看同一时刻看到的封口/打开严格一致。
+  const sealedAt = new Map(); // nodeId -> { sealed, reason, author, createdAt }
+  const sealRowsAt = db
+    .prepare(
+      `SELECT node_id AS nodeId, kind, note, author, created_at AS createdAt
+       FROM timeline
+       WHERE kind IN ('seal', 'unseal') AND seq <= ?
+       ORDER BY seq`,
+    )
+    .all(at);
+  for (const e of sealRowsAt) {
+    if (e.kind === 'seal') {
+      sealedAt.set(e.nodeId, { sealed: true, reason: (e.note || '').replace(/^封口：?/, ''), author: e.author, createdAt: e.createdAt });
+    } else {
+      sealedAt.set(e.nodeId, { sealed: false });
+    }
+  }
+
   // 4) 组装该文档在 at 时刻的可见树（格式与实时快照一致）
   const nodes = [];
+  const sealInfoAt = (sourceId) => {
+    const s = sealedAt.get(sourceId);
+    return s && s.sealed ? { sealed: true, reason: s.reason, author: s.author, createdAt: s.createdAt } : null;
+  };
   for (const [id, n] of tree) {
     if (n.docId !== docId || n.deleted) continue;
     if (!n.mirrorOf && !n.excerptOf) {
       const c = contentAt.get(id);
-      nodes.push({
+      const node = {
         id, parentId: n.parentId, pos: n.pos, kind: 'node',
         version: c ? c.version : 0,
         content: c ? c.content : '',
@@ -1070,7 +1148,10 @@ function getSnapshotAt(db, docId, seq) {
         authorId: c ? c.authorId : '',
         updatedAt: c ? c.updatedAt : null,
         aliveNow: aliveNow.has(id) ? 1 : 0,
-      });
+      };
+      const seal = sealInfoAt(id);
+      if (seal) node.seal = seal;
+      nodes.push(node);
     } else if (n.excerptOf) {
       // 摘录：展示该时刻最近一次冻结的正文，绝不投影源
       const src = tree.get(n.excerptOf);
@@ -1113,6 +1194,8 @@ function getSnapshotAt(db, docId, seq) {
           node.authorId = c.authorId;
           node.updatedAt = c.updatedAt;
         }
+        const seal = sealInfoAt(n.mirrorOf);
+        if (seal) node.seal = seal;
       }
       nodes.push(node);
     }
@@ -1337,6 +1420,124 @@ function resolveComment(db, { commentId, content, userId, userName }) {
   })();
 }
 
+// ---------- 段落封口（seal）----------
+//
+// 封口状态是 append-only 流：seal_events 每段最新一行决定"封着/开着"。
+// 与留言收掉同一套收敛思路——状态迁移本身就是 CAS：
+// - seal 事务里读到"已经封着" -> already（带回先封者的理由），绝不插入第二条、
+//   绝不广播第二份 sealed；两个几乎同时到达、理由不同的 seal 天然串行，
+//   先到者的理由是全员看到的唯一一份。
+// - unseal 同理：只有封着才能打开，重复打开幂等收敛，不产生第二条广播。
+// 每次状态翻转同事务追加一条 timeline（seal/unseal），回看时刻能重建当时封口状态。
+
+function normalizeSealEvent(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    nodeId: r.node_id,
+    docId: r.doc_id,
+    kind: r.kind,
+    sealed: r.kind === 'sealed',
+    reason: r.reason || '',
+    authorId: r.author_id,
+    author: r.author,
+    createdAt: r.created_at,
+  };
+}
+
+function latestSealEvent(db, nodeId) {
+  const row = db
+    .prepare('SELECT * FROM seal_events WHERE node_id = ? ORDER BY id DESC LIMIT 1')
+    .get(nodeId);
+  return normalizeSealEvent(row);
+}
+
+// 批量取若干源段"当前封着"的封口事件（快照/扇出用）。只返回封着的。
+function listCurrentSeals(db, nodeIds) {
+  const ids = [...new Set(nodeIds || [])];
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT s.* FROM seal_events s
+       JOIN (SELECT node_id, MAX(id) AS max_id FROM seal_events
+             WHERE node_id IN (${placeholders}) GROUP BY node_id) m
+         ON m.max_id = s.id
+       WHERE s.kind = 'sealed'`,
+    )
+    .all(...ids);
+  return rows.map(normalizeSealEvent);
+}
+
+// 当前段落是否封着（写路径的硬拦截用）
+function isSealed(db, nodeId) {
+  const latest = latestSealEvent(db, nodeId);
+  return !!(latest && latest.kind === 'sealed');
+}
+
+function editableSourceNode(db, nodeId) {
+  const node = getNode(db, nodeId);
+  if (!node || node.deleted || node.mirror_of || node.excerpt_of) return null;
+  return node;
+}
+
+function sealNode(db, { nodeId, reason, userId = '', userName = '' }) {
+  return db.transaction(() => {
+    const node = editableSourceNode(db, nodeId);
+    if (!node) return { status: 'invalid' };
+    const latest = latestSealEvent(db, nodeId);
+    if (latest && latest.kind === 'sealed') {
+      return { status: 'already', seal: latest };
+    }
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `INSERT INTO seal_events (node_id, doc_id, kind, reason, author_id, author, created_at)
+         VALUES (?, ?, 'sealed', ?, ?, ?, ?)`,
+      )
+      .run(nodeId, node.doc_id, reason, userId, userName, now);
+    const seal = normalizeSealEvent(db.prepare('SELECT * FROM seal_events WHERE id = ?').get(info.lastInsertRowid));
+    logEvent(db, {
+      docId: node.doc_id, kind: 'seal', nodeId,
+      author: userName, authorId: userId,
+      note: reason ? `封口：${reason}` : '封口', at: now,
+    });
+    return { status: 'sealed', seal };
+  })();
+}
+
+function unsealNode(db, { nodeId, reason = '', userId = '', userName = '' }) {
+  return db.transaction(() => {
+    const node = editableSourceNode(db, nodeId);
+    if (!node) return { status: 'invalid' };
+    const latest = latestSealEvent(db, nodeId);
+    if (!latest || latest.kind === 'unsealed') {
+      return { status: 'already_open', seal: latest };
+    }
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `INSERT INTO seal_events (node_id, doc_id, kind, reason, author_id, author, created_at)
+         VALUES (?, ?, 'unsealed', ?, ?, ?, ?)`,
+      )
+      .run(nodeId, node.doc_id, reason, userId, userName, now);
+    const seal = normalizeSealEvent(db.prepare('SELECT * FROM seal_events WHERE id = ?').get(info.lastInsertRowid));
+    logEvent(db, {
+      docId: node.doc_id, kind: 'unseal', nodeId,
+      author: userName, authorId: userId,
+      note: reason ? `重新打开：${reason}` : '重新打开', at: now,
+    });
+    return { status: 'unsealed', seal };
+  })();
+}
+
+// 删除路径用：待删子树里当前封着的段落 id（整笔删除必须事务前/事务内拒绝，
+// 不能让"删父级"绕过段落自己的封口）。
+function sealedIdsWithin(db, ids) {
+  if (!ids.length) return [];
+  return listCurrentSeals(db, ids).map((s) => s.nodeId);
+}
+
 module.exports = {
   DEFAULT_DOC,
   init,
@@ -1375,4 +1576,10 @@ module.exports = {
   getComment,
   createComment,
   resolveComment,
+  latestSealEvent,
+  listCurrentSeals,
+  isSealed,
+  sealNode,
+  unsealNode,
+  sealedIdsWithin,
 };
