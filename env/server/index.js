@@ -861,6 +861,15 @@ function handleSuggestionAccept(peer, msg) {
     acceptedBy: peer.user,
     acceptedSuggestionId: suggestionId,
   });
+  // 收下改写也让源正文前进了一版：摘录行同样要立刻翻「原文已改」（不带新正文）。
+  notifyExcerptSourceChanged(nodeId, result.revision.version);
+}
+
+// 通知所有挂了该源摘录的文档：源版本已前进，摘录陈旧标记该翻转（不含正文）。
+function notifyExcerptSourceChanged(sourceId, version) {
+  const docs = store.excerptHostDocs(db, sourceId);
+  if (!docs.length) return;
+  sendToDocs(docs, { type: 'excerpt_source_changed', sourceId, version });
 }
 
 // ---------- 内容保存：版本号乐观锁 + diff3 三方合并 ----------
@@ -988,6 +997,12 @@ function broadcastContent(nodeId, revision, exceptConnId = null, supersededSugge
   }, exceptConnId);
   // 提议失效要通知保存者自己：否则他屏幕上会残留已被自己新正文顶掉的卡片。
   broadcastSuggestionsSuperseded(nodeId, supersededSuggestionIds, null);
+
+  // 摘录不投影源：新正文一个字都不带过去（冻字不能变），但要立刻通知所有挂了
+  // 这段摘录的文档"源版本已走到 revision.version"——只盯着摘录行的人也要马上
+  // 看到「原文已改」徽章翻过来，不能等谁重新打开/拉快照才发现对不上。
+  // 含保存者本人（他的 saved 回执只更新源行，摘录徽章靠这条翻）。
+  notifyExcerptSourceChanged(nodeId, revision.version);
 }
 
 function broadcastSuggestionsSuperseded(nodeId, suggestionIds = [], exceptConnId = null, reason = '正文已更新为新版本') {

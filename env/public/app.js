@@ -904,6 +904,9 @@ function handleMessage(msg) {
     case 'excerpt_aligned':
       applyExcerptAligned(msg);
       break;
+    case 'excerpt_source_changed':
+      applyExcerptSourceChanged(msg);
+      break;
     case 'excerpt_align_ack':
       onExcerptAlignAck(msg);
       break;
@@ -1420,6 +1423,17 @@ function onExcerptAlignStale(msg) {
   }
   fillExcerptAlignMask({ conflict: true });
   toast('你确认期间原文又改了：已换成此刻真正的原文，请再看一眼后确认', 'error', 5200);
+}
+
+// 源正文往前走了一版：摘录的字一个都不动，但所有挂着这段摘录的行要立刻把
+// 「与原文一致」翻成「原文已改」。只盯着摘录行、没打开源大纲的人也马上看到，
+// 不用等重新拉快照。消息里刻意不带新正文——摘录这边永远只显示自己冻着的字。
+function applyExcerptSourceChanged(msg) {
+  for (const { view, node } of excerptRowsOfSource(msg.sourceId)) {
+    node.currentSourceVersion = msg.version;
+    node.stale = msg.version !== node.sourceVersion ? 1 : 0;
+    patchRow(view, node.id);
+  }
 }
 
 // 源删除：摘录保留最后冻住的字（那是摘那一刻的真实内容），但标墓碑、禁止对齐

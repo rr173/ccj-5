@@ -158,25 +158,29 @@ async function run() {
     assert.ok(source.content.includes('【源后来改的】'));
   });
 
-  // ---------- 3：源改了，摘录不收到 content（绝不悄悄换字）----------
-  await test('源的 content 广播不扇出到摘录宿主房间（只有跟读会实时变）', async () => {
-    // 用一个只进 hostDoc、不进 default 的原始连接（connect() 会自动打开默认文档）
+  // ---------- 3：源改了，摘录不收到 content（绝不悄悄换字），但立刻收到陈旧标记 ----------
+  await test('源改正文：摘录宿主不收到 content（字不被带走），但立刻收到 excerpt_source_changed 翻徽章', async () => {
+    // 用一个只进 hostDoc、不进 default 的原始连接（connect() 会自动打开默认文档）。
     // 编辑器连接 hello 时会自动订阅默认文档；这个看守只保留 hostDoc 房间，
-    // 才能证明"源正文广播不会因为摘录而扇出到宿主房间"。
+    // 才能区分“因为摘录引用而收到的消息”和“它本来就在源文档房间”。
     const watcher = await new Promise((resolve) => {
       const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
-      const c = { ws, contentMsgs: [], armed: false };
+      const c = { ws, contentMsgs: [], markerVersions: [], contentLeak: false, armed: false };
       ws.on('message', (raw) => {
         const m = JSON.parse(raw.toString());
         if (m.type === 'hello') c.armed = true;
-        if (c.armed && m.type === 'content' && m.nodeId === sourceId) c.contentMsgs.push(m);
+        if (!c.armed) return;
+        if (m.nodeId === sourceId && m.type === 'content') c.contentMsgs.push(m);
+        if (m.type === 'excerpt_source_changed' && m.sourceId === sourceId) c.markerVersions.push(m.version);
+        // 标记消息里绝不能夹带源的新正文（摘录这边永远只显示自己冻着的字）
+        if (m.type === 'excerpt_source_changed' && typeof m.content === 'string') c.contentLeak = true;
       });
       ws.on('open', () => {
         ws.send(JSON.stringify({ type: 'hello', userId: 'u-onlyhost2', userName: '只看宿主' }));
         setTimeout(() => {
           ws.send(JSON.stringify({ type: 'leave_doc', docId: 'default' }));
           ws.send(JSON.stringify({ type: 'open_doc', docId: hostDoc.id }));
-          setTimeout(() => { c.contentMsgs = []; resolve(c); }, 300);
+          setTimeout(() => { c.contentMsgs = []; c.markerVersions = []; resolve(c); }, 300);
         }, 100);
       });
     });
@@ -186,11 +190,16 @@ async function run() {
       content: source.content + '【再改一次】',
       baseVersion: v,
     });
-    await alice.next((m) => m.type === 'saved');
-    await new Promise((r) => setTimeout(r, 300));
-    assert.strictEqual(watcher.contentMsgs.length, 0, '摘录宿主房间不应收到源正文广播');
+    await alice.next((m) => m.type === 'saved' && m.nodeId === sourceId);
+    // 等标记消息到达（必须是推过来的，不是看守重新拉的快照）
+    for (let i = 0; i < 40 && !watcher.markerVersions.length; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.strictEqual(watcher.contentMsgs.length, 0, '摘录宿主房间不应收到源正文 content（不能带走冻字）');
+    assert.ok(!watcher.contentLeak, '陈旧标记消息里不许夹带源正文');
+    assert.deepStrictEqual(watcher.markerVersions, [v + 1], '立刻收到一条只带源新版本号的标记');
     watcher.ws.close();
-    // 但重取快照时能看到 stale 与新源版本，冻字依旧
+    // 重取快照：stale=1、新源版本可见，但冻字依旧
     const hostSnap = await latestSnapshot(hostDoc.id);
     const ex = hostSnap.nodes.find((n) => n.id === excerptId);
     assert.ok(!ex.content.includes('【再改一次】'), '摘录仍冻着');
