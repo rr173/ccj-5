@@ -373,6 +373,20 @@ button.danger-text { color: var(--danger); }
 
 /* 留言弹窗 */
 .comment-panel-card { width: 560px; }
+
+/* 编辑态下挂在编辑器下方的留言区：改正文时留言一直可见 */
+.edit-comments {
+  margin: 4px 12px 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.edit-comments-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.edit-comments-title { font-size: 12px; color: var(--muted); font-weight: 600; }
+.edit-comments-head button { font-size: 12px; padding: 2px 10px; }
+.edit-comments .comment-list { padding: 0; }
 .comment-panel-list {
   display: flex; flex-direction: column; gap: 8px;
   max-height: 46vh; overflow-y: auto;

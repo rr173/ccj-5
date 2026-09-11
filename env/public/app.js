@@ -1898,6 +1898,9 @@ function renderNodeRow(view, node) {
 
   if (isEditingHere) {
     el.appendChild(renderEditor(node));
+    // 改正文时留言不能从屏幕上消失：编辑器之外单独挂一块留言区，
+    // 编辑期间别人补话/收掉也只实时刷新这一块（绝不重绘 textarea）。
+    if (node.kind !== 'excerpt') el.appendChild(renderEditComments(findViewDocOfNode(node.id), node));
     return el;
   }
 
@@ -1987,7 +1990,7 @@ function renderNodeRow(view, node) {
 
   // 段落留言：锚定这一行（跟读挂载行与源行各自独立）；正文怎么改留言都在
   if (node.kind !== 'excerpt') {
-    const comments = commentsForNode(view.id || state.activeDocId, node.id);
+    const comments = commentsForNode(state.activeDocId, node.id);
     if (comments.length) el.appendChild(renderCommentList(node, comments));
   }
 
@@ -2079,7 +2082,7 @@ function renderNodeRow(view, node) {
   }
   // 留言计数：有未收留言时给一个可点的蓝色徽章（点开留言面板）；全收完只在悬浮操作条看数量
   if (node.kind !== 'excerpt') {
-    const list = commentsForNode(view.id || state.activeDocId, node.id);
+    const list = commentsForNode(state.activeDocId, node.id);
     const openN = list.filter((c) => c.status !== 'resolved').length;
     if (openN > 0) {
       const badge = document.createElement('span');
@@ -2166,10 +2169,49 @@ function actionBtn(label, onClick, danger = false) {
 
 // 悬浮操作条上的留言按钮文案：把未收/已收数量带出来
 function commentActionLabel(view, nodeId) {
-  const list = commentsForNode(view.id || state.activeDocId, nodeId);
+  const list = commentsForNode(state.activeDocId, nodeId);
   if (!list.length) return '💬 留言';
   const openN = list.filter((c) => c.status !== 'resolved').length;
   return openN ? `💬 留言 ${openN}/${list.length}` : `💬 留言 0/${list.length}`;
+}
+
+// 编辑态下挂在编辑器下方的留言区：改正文时留言始终可见、可收，
+// 新来的留言只由 patchEditComments 替换这一块，textarea 与编辑状态不受影响。
+function renderEditComments(docId, node) {
+  const box = document.createElement('div');
+  box.className = 'edit-comments';
+  box.dataset.nodeId = node.id;
+
+  const head = document.createElement('div');
+  head.className = 'edit-comments-head';
+  const list = commentsForNode(docId, node.id);
+  const openN = list.filter((c) => c.status !== 'resolved').length;
+  const title = document.createElement('span');
+  title.className = 'edit-comments-title';
+  title.textContent = list.length
+    ? `这段的留言 · ${openN} 条未收 / 共 ${list.length} 条`
+    : '这段还没有留言';
+  const writeBtn = document.createElement('button');
+  writeBtn.type = 'button';
+  writeBtn.className = 'ghost';
+  writeBtn.textContent = '💬 写留言';
+  writeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openCommentPanel(node.id);
+  });
+  head.append(title, writeBtn);
+  box.appendChild(head);
+
+  if (list.length) box.appendChild(renderCommentList(node, list));
+  return box;
+}
+
+// 只替换编辑行里的留言块（保留编辑器/焦点/草稿）；没有该块则不做任何事。
+function patchEditComments(nodeId) {
+  const outer = document.querySelector(`.node-outer[data-node-id="${cssEscape(nodeId)}"]`);
+  const box = outer?.querySelector(':scope > .node > .edit-comments');
+  if (!box) return;
+  box.replaceWith(renderEditComments(findViewDocOfNode(nodeId), { id: nodeId }));
 }
 
 function renderCommentList(node, comments) {
@@ -2403,7 +2445,12 @@ function patchEditorStatus() {
 }
 
 function patchRow(view, nodeId) {
-  if (edit.entryNodeId === nodeId) return; // 编辑器自己管内容，不重绘
+  // 编辑入口行：textarea/焦点/草稿由编辑器自己管，绝不能整体重绘；
+  // 但留言区必须实时更新（编辑期间别人补话/收掉，当场就该看见，不能等存完）。
+  if (edit.entryNodeId === nodeId) {
+    patchEditComments(nodeId);
+    return;
+  }
   const outer = document.querySelector(`.node-outer[data-node-id="${cssEscape(nodeId)}"]`);
   if (!outer) return;
   const node = view.nodes.get(nodeId);

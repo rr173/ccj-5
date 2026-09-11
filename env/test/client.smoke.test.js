@@ -131,6 +131,80 @@ async function main() {
     '源行显示新正文',
   );
 
+  // ---- 回归：编辑一段时，这段底下挂着的留言必须一直可见；别人补话/收掉要实时出现，不能等存完 ----
+  {
+    const editAgain = [...$$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-actions button`)]
+      .find((b) => b.textContent === '编辑');
+    editAgain.click();
+    await sleep(250);
+    const editTa = $('#outline textarea');
+    assert(!!editTa, '源段落重新进入编辑态（留言回归用例）');
+
+    // 先放一条"早就挂着"的留言（另一个连接写入），进入编辑前/后都应看得到
+    await new Promise((resolve, reject) => {
+      const other = new WS(`ws://127.0.0.1:${PORT}/ws`);
+      let stage = 0;
+      other.on('open', () => other.send(JSON.stringify({ type: 'hello', userId: 'u-edit-comment', userName: '编辑时留言的人' })));
+      other.on('error', reject);
+      other.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'snapshot' && stage === 0) {
+          const target = msg.nodes.find((n) => n.id === sourceNodeId);
+          stage = 1;
+          other.send(JSON.stringify({ type: 'comment_add', nodeId: sourceNodeId, commentId: 'cmt-edit-existing', content: '编辑前就挂着的留言' }));
+        } else if (msg.type === 'comment_added' && msg.comment?.id === 'cmt-edit-existing' && stage === 1) {
+          stage = 2;
+          setTimeout(() => { other.close(); resolve(); }, 300);
+        }
+      });
+    });
+    await sleep(300);
+    const sOuter = $(`.node-outer[data-node-id="${sourceNodeId}"]`);
+    assert(!!sOuter.querySelector('.edit-comments'), '编辑态下有挂在编辑器下方的留言区');
+    assert(sOuter.textContent.includes('编辑前就挂着的留言'), '已有留言在编辑态下仍然可见（没有从自己屏幕上消失）');
+    assert(sOuter.textContent.includes('写留言'), '编辑态留言区有写留言入口');
+
+    // 打一半、还没保存的草稿
+    editTa.value = editTa.value + '【编辑中没保存的草稿】';
+    editTa.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    // 编辑期间，对方再补一句、再把第一句收掉：本界面留言块实时更新，编辑器不动
+    await new Promise((resolve, reject) => {
+      const other = new WS(`ws://127.0.0.1:${PORT}/ws`);
+      let stage = 0;
+      other.on('open', () => other.send(JSON.stringify({ type: 'hello', userId: 'u-edit-comment2', userName: '编辑时留言的人' })));
+      other.on('error', reject);
+      other.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'snapshot' && stage === 0) {
+          stage = 1;
+          other.send(JSON.stringify({ type: 'comment_add', nodeId: sourceNodeId, commentId: 'cmt-edit-late', content: '你编辑时对方补的一句' }));
+        } else if (msg.type === 'comment_added' && msg.comment?.id === 'cmt-edit-late' && stage === 1) {
+          stage = 2;
+          other.send(JSON.stringify({ type: 'comment_resolve', commentId: 'cmt-edit-existing', content: '边改边收：已处理' }));
+        } else if (msg.type === 'comment_resolved' && msg.comment?.id === 'cmt-edit-existing' && stage === 2) {
+          stage = 3;
+          setTimeout(() => { other.close(); resolve(); }, 300);
+        }
+      });
+    });
+    await sleep(300);
+    assert(sOuter.textContent.includes('你编辑时对方补的一句'), '编辑期间新来的留言当场出现，不用等存完');
+    assert(sOuter.textContent.includes('已收（编辑时留言的人）'), '编辑期间被收掉的留言当场变已收');
+    assert(sOuter.textContent.includes('边改边收：已处理'), '收掉的说法实时一致');
+    const taStill = $('#outline textarea');
+    assert(!!taStill, '编辑器仍然开着（没被留言刷新顶掉）');
+    assert(taStill.value.includes('【编辑中没保存的草稿】'), '未保存草稿原样保留（刷留言没碰编辑器）');
+
+    // Esc 取消编辑：草稿不保存，但留言仍在该段（与正文保存与否无关）
+    taStill.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await sleep(250);
+    const afterOuter = $(`.node-outer[data-node-id="${sourceNodeId}"]`);
+    assert(afterOuter.textContent.includes('你编辑时对方补的一句'), '取消编辑后留言仍在');
+    assert(afterOuter.textContent.includes('边改边收：已处理'), '取消编辑后已收状态仍在');
+    assert(!afterOuter.textContent.includes('【编辑中没保存的草稿】'), '取消即未保存草稿（留言不受影响）');
+  }
+
   // 切到第二份大纲，跟读必须同步（房间始终订阅，消息已应用）
   $$('.doc-tab-label')[1].click();
   await sleep(200);
