@@ -452,9 +452,16 @@ function toast(message, kind = '', ms = 2600) {
   return ++toastSeq;
 }
 
-// 跟读行 -> 源 id；普通行 -> 自己
+// 跟读行 -> 源 id；摘录行 -> 摘录的源 id（只读引用用）；普通行 -> 自己。
+// 注意：摘录行的源 id 只用于"去源/陈旧判定"，它的正文不投影源（冻在 node.content 里）。
 function sourceIdOf(node) {
-  return node.kind === 'mirror' ? node.mirrorOf : node.id;
+  if (node.kind === 'mirror') return node.mirrorOf;
+  if (node.kind === 'excerpt') return node.excerptOf;
+  return node.id;
+}
+
+function isReferenceRow(node) {
+  return node.kind === 'mirror' || node.kind === 'excerpt';
 }
 
 function viewOf(docId) {
@@ -476,7 +483,8 @@ function findRow(nodeId) {
   return null;
 }
 
-// 某个源 id 在各已加载文档里的全部可见行（源行本身 + 跟读行）
+// 某个源 id 在各已加载文档里的全部"投影行"（源行本身 + 跟读行）。
+// 不含摘录行：摘录不投影源，源改正文不能动摘录的字。
 function rowsOfSource(sourceId) {
   const out = [];
   for (const view of state.views.values()) {
@@ -484,6 +492,17 @@ function rowsOfSource(sourceId) {
     if (own) out.push({ view, node: own });
     for (const node of view.nodes.values()) {
       if (node.kind === 'mirror' && node.mirrorOf === sourceId) out.push({ view, node });
+    }
+  }
+  return out;
+}
+
+// 某个源 id 对应的全部摘录行（跨已加载文档）：源删除时用来立墓碑
+function excerptRowsOfSource(sourceId) {
+  const out = [];
+  for (const view of state.views.values()) {
+    for (const node of view.nodes.values()) {
+      if (node.kind === 'excerpt' && node.excerptOf === sourceId) out.push({ view, node });
     }
   }
   return out;
@@ -872,6 +891,33 @@ function handleMessage(msg) {
         flashRow(msg.docId, msg.node.id);
       }
       break;
+    case 'excerpt_added':
+      upsertNode(msg.docId, msg.node, msg.treeRev);
+      if (msg.by === state.me.userId) {
+        // 做摘录的人：直接切到那份大纲看冻住的结果
+        if (!state.tabs.includes(msg.docId)) state.tabs.push(msg.docId);
+        activateTab(msg.docId);
+        state.pendingFocus = { docId: msg.docId, nodeId: msg.node.id };
+        flashRow(msg.docId, msg.node.id);
+      }
+      break;
+    case 'excerpt_aligned':
+      applyExcerptAligned(msg);
+      break;
+    case 'excerpt_align_ack':
+      onExcerptAlignAck(msg);
+      break;
+    case 'excerpt_align_stale':
+      onExcerptAlignStale(msg);
+      break;
+    case 'excerpt_align_gone':
+      $('#excerpt-align-btn')?.classList.remove('busy');
+      $('#excerpt-align-mask').classList.add('hidden');
+      toast(msg.message || '源段落已被删除，无法对齐', 'error', 4200);
+      break;
+    case 'excerpt_source_deleted':
+      applyExcerptSourceDeleted(msg);
+      break;
     case 'node_moved':
       applyMove(msg);
       break;
@@ -1150,7 +1196,7 @@ function applyPendingFocus() {
   });
   if (f.edit) {
     const node = view.nodes.get(f.nodeId);
-    if (node.kind !== 'mirror' || !node.sourceDeleted) beginEdit(node.id);
+    if (node.kind === 'node' || (node.kind === 'mirror' && !node.sourceDeleted)) beginEdit(node.id);
   }
 }
 
@@ -1301,6 +1347,93 @@ function applySourceDeleted(msg) {
     }
     state.proposals.delete(sourceId);
     if (edit.sourceId === sourceId) stopEditing('跟读的源段落已被删除');
+  }
+}
+
+/* ================= 摘录（excerpt）：冻一份字，显式对齐，CAS 防并发 =================
+ *
+ * 摘录与跟读相反：正文在摘录那一刻复制冻结到 node 自己身上（node.content），
+ * 源之后怎么改，这行字都不变。只有有人显式点「对齐到原文」并确认后，才会把
+ * 源此刻的正文重新冻一份（服务器 excerpt_aligned 广播，全员同一份）。
+ *
+ * - 源版本 > 摘录冻结版本（node.stale）：行上明示「原文已改」，绝不悄悄换字。
+ * - 对齐必须带 baseSourceVersion（确认弹窗里看到的源当前版本）：两个人几乎同时
+ *   对齐、各自认定的原文对不上时，后到者收到 excerpt_align_stale + 此刻真正的
+ *   原文，冻字维持上一份，重确认后才能成功——不会两边成功却不一样。
+ * - 取消/关弹窗不发请求：摘录还是上一份冻字，反悔零成本。
+ * - 离线不能对齐（结构 CAS 同类限制）：直接拦下，冻字不受影响。
+ */
+const excerptAlign = {
+  nodeId: null,        // 正在确认对齐的摘录行 id
+  sourceVersion: 0,    // 弹窗里展示、提交时作为 CAS 基准的源版本
+  sourceContent: '',
+  frozenVersion: 0,
+  frozenContent: '',
+  requestId: 0,        // 只认最新一次打开/刷新弹窗的回执
+};
+
+function applyExcerptAligned(msg) {
+  const found = findRow(msg.nodeId);
+  if (!found) return;
+  const { view, node } = found;
+  node.content = msg.content;
+  node.sourceVersion = msg.sourceVersion;
+  node.version = msg.sourceVersion;
+  node.updatedAt = msg.frozenAt;
+  node.frozenAt = msg.frozenAt;
+  node.sourceDeleted = 0;
+  node.currentSourceVersion = msg.currentSourceVersion;
+  node.stale = msg.currentSourceVersion !== msg.sourceVersion ? 1 : 0;
+  node.author = msg.by?.userName || node.author;
+  node.authorId = msg.by?.userId || node.authorId;
+  patchRow(view, node.id);
+  // 若对齐弹窗正开着且对的就是这行（别的标签页/另一个人对齐成功），同步弹窗基准
+  if (excerptAlign.nodeId === msg.nodeId && excerptAlign.requestId) {
+    excerptAlign.frozenVersion = msg.sourceVersion;
+    excerptAlign.frozenContent = msg.content;
+    if (excerptAlign.sourceVersion === msg.sourceVersion) closeExcerptAlignMask();
+  }
+}
+
+function onExcerptAlignAck(msg) {
+  $('#excerpt-align-btn')?.classList.remove('busy');
+  // 正常对齐：内容以广播 excerpt_aligned 为唯一事实（同房间所有端逐字一致）；
+  // 这里只关弹窗。unchanged（字本来就一样）时同样收敛关闭。
+  if (excerptAlign.nodeId === msg.nodeId) closeExcerptAlignMask();
+  if (msg.unchanged) toast(msg.message || '原文与摘录相同，无需更新', '');
+}
+
+// 并发对齐输了/确认期间源又被改：弹窗不关，换成"此刻真正的原文"让用户重确认；
+// 在用户重新确认前，行上冻字纹丝不动（服务器也没落任何新冻结）。
+function onExcerptAlignStale(msg) {
+  $('#excerpt-align-btn')?.classList.remove('busy');
+  if (excerptAlign.nodeId !== msg.nodeId) {
+    toast(msg.message || '对齐期间原文已有更新，请重新打开对齐', 'error', 4600);
+    return;
+  }
+  excerptAlign.requestId++;
+  excerptAlign.sourceVersion = msg.current.version;
+  excerptAlign.sourceContent = msg.current.content;
+  if (msg.frozen) {
+    excerptAlign.frozenVersion = msg.frozen.sourceVersion;
+    excerptAlign.frozenContent = msg.frozen.content;
+  }
+  fillExcerptAlignMask({ conflict: true });
+  toast('你确认期间原文又改了：已换成此刻真正的原文，请再看一眼后确认', 'error', 5200);
+}
+
+// 源删除：摘录保留最后冻住的字（那是摘那一刻的真实内容），但标墓碑、禁止对齐
+function applyExcerptSourceDeleted(msg) {
+  for (const sourceId of msg.sourceIds || []) {
+    for (const { view, node } of excerptRowsOfSource(sourceId)) {
+      node.sourceDeleted = 1;
+      node.stale = 0;
+      patchRow(view, node.id);
+    }
+    if (excerptAlign.nodeId) {
+      const row = findRow(excerptAlign.nodeId)?.node;
+      if (row && row.excerptOf === sourceId) closeExcerptAlignMask();
+    }
   }
 }
 
@@ -1668,12 +1801,15 @@ function renderNodeRow(view, node) {
   const lockedByOther = !!lock && (!state.me || lock.userId !== state.me.userId);
 
   const el = document.createElement('div');
-  el.className = 'node' + (node.kind === 'mirror' ? ' mirror-node' : '');
+  el.className = 'node' +
+    (node.kind === 'mirror' ? ' mirror-node' : '') +
+    (node.kind === 'excerpt' ? ' excerpt-node' : '');
   el.dataset.nodeId = node.id;
   if (isPresentationTarget(node.id)) el.classList.add('presentation-target');
   if (isEditingHere || lockedByMe) el.classList.add('locked-by-me');
   if (lockedByOther) el.classList.add('locked-by-other');
   if (node.kind === 'mirror' && node.sourceDeleted) el.classList.add('source-gone');
+  if (node.kind === 'excerpt' && node.stale) el.classList.add('excerpt-stale');
 
   if (isEditingHere) {
     el.appendChild(renderEditor(node));
@@ -1690,8 +1826,14 @@ function renderNodeRow(view, node) {
     content.innerHTML =
       '<span class="tombstone-mark">🪦</span> 跟读的源段落已被删除' +
       '<div class="tombstone-sub">此处不再显示正文；可打开源大纲查看历史或重新建立跟读</div>';
+  } else if (node.kind === 'excerpt' && node.sourceDeleted) {
+    // 摘录源没了：最后一次冻住的字仍保留（那是摘那一刻的真实内容），但明示源已删、不能再对齐
+    content.className = 'node-content excerpt-content excerpt-source-gone';
+    content.textContent = node.content || '（空摘录）';
   } else {
-    content.className = 'node-content' + (node.content ? '' : ' placeholder');
+    content.className = 'node-content' +
+      (node.kind === 'excerpt' ? ' excerpt-content' : '') +
+      (node.content ? '' : ' placeholder');
     content.textContent = node.content || '（空段落）';
   }
   row.appendChild(content);
@@ -1703,6 +1845,7 @@ function renderNodeRow(view, node) {
       actions.append(
         actionBtn('编辑', () => beginEdit(node.id)),
         actionBtn('提改写', () => openSuggestionComposer(node.id)),
+        actionBtn('做摘录', () => createExcerpt(node.id)),
         actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
         actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       );
@@ -1713,10 +1856,33 @@ function renderNodeRow(view, node) {
       actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
       actionBtn('移除跟读', () => removeMirror(node.id), true),
     );
+  } else if (node.kind === 'excerpt') {
+    if (!node.sourceDeleted) {
+      if (node.stale) {
+        actions.append(
+          actionBtn('⇪ 对齐到原文', () => openExcerptAlign(node.id)),
+        );
+      } else {
+        actions.append(
+          actionBtn('↻ 重新对齐原文', () => openExcerptAlign(node.id)),
+        );
+      }
+      actions.append(
+        actionBtn('↗ 去源大纲', () => jumpToSourceForExcerpt(node)),
+        actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
+      );
+    } else {
+      actions.append(actionBtn('↗ 打开源大纲', () => jumpToSourceForExcerpt(node)));
+    }
+    actions.append(
+      actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
+      actionBtn('移除摘录', () => removeExcerpt(node.id), true),
+    );
   } else {
     actions.append(
       actionBtn('编辑', () => beginEdit(node.id)),
       actionBtn('提改写', () => openSuggestionComposer(node.id)),
+      actionBtn('做摘录', () => createExcerpt(node.id)),
       actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       actionBtn('＋子级', () => addNode(node.id, null)),
       actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
@@ -1727,7 +1893,7 @@ function renderNodeRow(view, node) {
   row.appendChild(actions);
   el.appendChild(row);
 
-  if (!(node.kind === 'mirror' && node.sourceDeleted)) {
+  if (node.kind === 'node' || (node.kind === 'mirror' && !node.sourceDeleted)) {
     const proposals = proposalsForSource(sourceId);
     if (proposals.length) el.appendChild(renderSuggestionList(node, sourceId, proposals));
   }
@@ -1747,11 +1913,52 @@ function renderNodeRow(view, node) {
     }
     meta.appendChild(tag);
   }
-  const versionTag = document.createElement('span');
-  versionTag.className = 'version-tag';
-  versionTag.textContent = `v${node.version ?? '—'}`;
-  meta.appendChild(versionTag);
-  if (node.author && !node.sourceDeleted) {
+  if (node.kind === 'excerpt') {
+    const tag = document.createElement('span');
+    tag.className = 'excerpt-tag';
+    const srcDoc = node.sourceDocId ? state.docs.get(node.sourceDocId) : null;
+    tag.textContent = '📌 摘录自：' + (srcDoc ? srcDoc.title : '另一份大纲') +
+      `（抄于源 v${node.sourceVersion ?? '—'}）`;
+    if (!node.sourceDeleted) {
+      tag.classList.add('mirror-tag-link');
+      tag.title = '点此跳到源大纲';
+      tag.addEventListener('click', () => jumpToSourceForExcerpt(node));
+    }
+    meta.appendChild(tag);
+  }
+  if (node.kind !== 'excerpt') {
+    const versionTag = document.createElement('span');
+    versionTag.className = 'version-tag';
+    versionTag.textContent = `v${node.version ?? '—'}`;
+    meta.appendChild(versionTag);
+  }
+  if (node.kind === 'excerpt') {
+    // 摘录的状态徽章：已对齐 / 原文已改（点了就去对齐）/ 源已删
+    const badge = document.createElement('span');
+    if (node.sourceDeleted) {
+      badge.className = 'excerpt-badge gone';
+      badge.textContent = '🪦 源段落已删除；这行保留最后一次冻结的正文';
+    } else if (node.stale) {
+      badge.className = 'excerpt-badge stale';
+      badge.textContent =
+        `⚠ 原文已改到 v${node.currentSourceVersion}，这行还停在摘录时的 v${node.sourceVersion}（点此对齐）`;
+      badge.title = '摘录不会自动换字。点此查看此刻原文，确认后所有人看到同一份新摘录。';
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openExcerptAlign(node.id);
+      });
+    } else {
+      badge.className = 'excerpt-badge fresh';
+      badge.textContent = `✓ 与原文 v${node.sourceVersion} 一致（源再改不会自动换字）`;
+    }
+    meta.appendChild(badge);
+    if (node.frozenAt) {
+      const who = document.createElement('span');
+      who.className = 'muted';
+      who.textContent = `摘录/对齐：${node.author || '成员'} · ${fmtTime(node.frozenAt)}`;
+      meta.appendChild(who);
+    }
+  } else if (node.author && !node.sourceDeleted) {
     const tag = document.createElement('span');
     tag.className = 'muted';
     tag.textContent = `最后修改：${node.author} · ${fmtTime(node.updatedAt)}`;
@@ -1917,6 +2124,10 @@ function beginEdit(nodeId) {
     toast('源段落已删除，不能再编辑', 'error');
     return;
   }
+  if (node.kind === 'excerpt') {
+    toast('摘录是冻住的副本，不能直接改；点「对齐到原文」更新它，或点「去源大纲」改原文', 'error', 4200);
+    return;
+  }
   const sourceId = sourceIdOf(node);
   const sourceRow = rowsOfSource(sourceId).find((r) => r.node.kind !== 'mirror')?.node;
   const lockHolder = [...state.views.values()]
@@ -1986,7 +2197,7 @@ function beginEdit(nodeId) {
 function findDocOfNode(nodeId) {
   for (const [docId, view] of state.views) {
     const n = view.nodes.get(nodeId);
-    if (n && n.kind !== 'mirror') return docId;
+    if (n && n.kind !== 'mirror' && n.kind !== 'excerpt') return docId;
   }
   return state.activeDocId;
 }
@@ -2292,6 +2503,10 @@ function addNode(parentId, afterId) {
       toast('跟读段落下不能再加子级', 'error');
       return;
     }
+    if (found.node.kind === 'excerpt') {
+      toast('摘录是引用行，其下不能再加子级', 'error');
+      return;
+    }
     docId = [...state.views.entries()].find(([, v]) => v.nodes.has(parentId))?.[0];
   }
   const view = viewOf(docId);
@@ -2314,6 +2529,10 @@ function deleteNode(nodeId) {
   if (!found) return;
   if (found.node.kind === 'mirror') {
     removeMirror(nodeId);
+    return;
+  }
+  if (found.node.kind === 'excerpt') {
+    removeExcerpt(nodeId);
     return;
   }
   const mirrorCount = countMirrors(nodeId);
@@ -2344,7 +2563,188 @@ function removeMirror(nodeId) {
   send({ type: 'delete', nodeId, treeRev: found.view.treeRev });
 }
 
-/* ================= 挂跟读：选择目标大纲 ================= */
+/* ================= 做摘录：选目标大纲（同跟读选择器，但抄的是冻住的字） ================= */
+
+function createExcerpt(nodeId) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  // 只能摘录普通段落：跟读行其实也指向普通源，解析到源；摘录行不能再摘
+  const node = found.node;
+  if (node.kind === 'excerpt') {
+    toast('摘录不能再被摘录；请去它的源段落做新摘录', 'error');
+    return;
+  }
+  const sourceId = node.kind === 'mirror' ? node.mirrorOf : node.id;
+  const sourceDocId = findDocOfNode(sourceId);
+  const select = $('#excerpt-doc-select');
+  select.innerHTML = '';
+  // 默认允许摘到同一份大纲（"挂到别处"的别处也可以是同份大纲的另一处），
+  // 也允许摘到其它大纲。
+  const docs = [...state.docs.values()];
+  if (!docs.length) {
+    toast('还没有可用的大纲', 'error');
+    return;
+  }
+  for (const d of docs) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.id === sourceDocId ? `${d.title}（本大纲）` : d.title;
+    select.appendChild(opt);
+  }
+  // 默认选另一份大纲（典型用法），没有别的就留在本大纲
+  const other = docs.find((d) => d.id !== sourceDocId);
+  select.value = other ? other.id : sourceDocId;
+  excerptPicker.sourceId = sourceId;
+  $('#excerpt-help').textContent =
+    '摘录会把这一段此刻的正文原样抄一份到目标大纲顶层并冻住：源以后再改，摘录不会自动变；' +
+    '需要时点摘录上的「对齐到原文」才会更新（要再确认一次）。';
+  $('#excerpt-mask').classList.remove('hidden');
+}
+
+const excerptPicker = { sourceId: null };
+
+$('#excerpt-cancel').addEventListener('click', () => $('#excerpt-mask').classList.add('hidden'));
+$('#excerpt-mask').addEventListener('click', (e) => {
+  if (e.target === $('#excerpt-mask')) $('#excerpt-mask').classList.add('hidden');
+});
+$('#excerpt-confirm').addEventListener('click', () => {
+  const targetDocId = $('#excerpt-doc-select').value;
+  const sourceId = excerptPicker.sourceId;
+  if (!targetDocId || !sourceId) return;
+  if (!requireOnline()) return;
+  const doSend = () => {
+    const view = viewOf(targetDocId);
+    if (!view) return false;
+    send({
+      type: 'add_excerpt',
+      sourceId,
+      docId: targetDocId,
+      parentId: '',
+      afterId: '',
+      treeRev: view.treeRev,
+    });
+    return true;
+  };
+  if (!doSend()) {
+    requestDoc(targetDocId);
+    let tries = 0;
+    const t = setInterval(() => {
+      if (doSend() || ++tries > 20) clearInterval(t);
+    }, 100);
+  }
+  $('#excerpt-mask').classList.add('hidden');
+});
+
+/* ================= 对齐摘录到原文此刻：显式确认 + CAS ================= */
+
+function jumpToSourceForExcerpt(node) {
+  if (!node.sourceDocId) {
+    toast('源所在的大纲信息缺失', 'error');
+    return;
+  }
+  // 摘录只读、不能从摘录进编辑器：只跳到源段落让人看
+  jumpToSource({ sourceDocId: node.sourceDocId, mirrorOf: node.excerptOf, sourceDeleted: node.sourceDeleted }, {});
+}
+
+// 打开对齐确认弹窗：展示"摘录现在冻的字"与"原文此刻的字"。
+// 只有点确认才发 excerpt_align，且带上在本弹窗里看到的源版本号作为 CAS 基准；
+// 取消/关窗什么都不发，摘录保持上一份冻字。
+function openExcerptAlign(nodeId) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  const node = found.node;
+  if (node.kind !== 'excerpt' || node.sourceDeleted) {
+    toast('源段落已删除，不能再对齐', 'error');
+    return;
+  }
+  // 原文此刻的字与版本：优先用已加载的源行（源可能在另一份大纲，需取它的快照）
+  const sourceRow = rowsOfSource(node.excerptOf).find((r) => r.node.kind !== 'mirror' && r.node.kind !== 'excerpt')?.node;
+  if (!sourceRow) {
+    // 源在还没打开的大纲：先打开再弹
+    openExcerptAlignWhenSourceReady(nodeId, node);
+    return;
+  }
+  excerptAlign.nodeId = nodeId;
+  excerptAlign.requestId++;
+  excerptAlign.frozenVersion = node.sourceVersion;
+  excerptAlign.frozenContent = node.content || '';
+  excerptAlign.sourceVersion = sourceRow.version;
+  excerptAlign.sourceContent = sourceRow.content || '';
+  fillExcerptAlignMask({ conflict: false });
+  $('#excerpt-align-mask').classList.remove('hidden');
+}
+
+async function openExcerptAlignWhenSourceReady(nodeId, node) {
+  const ok = await ensureOpen(node.sourceDocId);
+  if (!ok) return;
+  for (let i = 0; i < 30; i++) {
+    const view = viewOf(node.sourceDocId);
+    const src = view?.nodes.get(node.excerptOf);
+    if (src) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  openExcerptAlign(nodeId);
+}
+
+function fillExcerptAlignMask({ conflict = false } = {}) {
+  $('#ea-title').textContent = conflict ? '原文刚又改过：确认对齐到此刻这版？' : '把摘录对齐到原文此刻？';
+  $('#ea-frozen-version').textContent = `摘录当前冻自源 v${excerptAlign.frozenVersion}`;
+  $('#ea-source-version').textContent =
+    `原文此刻是 v${excerptAlign.sourceVersion}` + (conflict ? '（已刷新为最新，请再确认一眼）' : '');
+  $('#ea-frozen').value = excerptAlign.frozenContent || '（空）';
+  $('#ea-source').value = excerptAlign.sourceContent || '（空）';
+  const same = excerptAlign.frozenContent === excerptAlign.sourceContent;
+  $('#ea-same').classList.toggle('hidden', !same);
+  $('#ea-diff').classList.toggle('hidden', same);
+}
+
+function closeExcerptAlignMask() {
+  $('#excerpt-align-mask').classList.add('hidden');
+  $('#excerpt-align-btn')?.classList.remove('busy');
+  excerptAlign.nodeId = null;
+  excerptAlign.requestId++;
+}
+
+$('#excerpt-align-cancel').addEventListener('click', () => {
+  // 反悔：不发任何请求，摘录仍是上一份冻字
+  closeExcerptAlignMask();
+});
+$('#excerpt-align-mask').addEventListener('click', (e) => {
+  if (e.target === $('#excerpt-align-mask')) closeExcerptAlignMask();
+});
+$('#excerpt-align-btn').addEventListener('click', () => {
+  const nodeId = excerptAlign.nodeId;
+  if (!nodeId) return;
+  if (!requireOnline()) return;
+  // 此刻只把"我在弹窗里看到、并明确确认对齐"的源版本号带上。
+  // 服务器在事务内核验：源没再往前走才冻结；否则回 stale 让我们看新原文重确认。
+  const requestId = excerptAlign.requestId;
+  $('#excerpt-align-btn').classList.add('busy');
+  send({
+    type: 'excerpt_align',
+    nodeId,
+    baseSourceVersion: excerptAlign.sourceVersion,
+  });
+  // 兜底：弹窗保持可取消；真正关窗等 excerpt_aligned / ack / stale
+  setTimeout(() => {
+    if (excerptAlign.nodeId === nodeId && excerptAlign.requestId === requestId) {
+      $('#excerpt-align-btn')?.classList.remove('busy');
+    }
+  }, 4000);
+});
+
+function removeExcerpt(nodeId) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  if (!confirm('移除这处摘录？（只删这份冻结副本，源段落和其它摘录不受影响）')) return;
+  send({ type: 'delete', nodeId, treeRev: found.view.treeRev });
+}
 
 const mirrorPicker = { sourceId: null };
 
@@ -2563,7 +2963,10 @@ $('#timeline-close').addEventListener('click', () => {
 });
 $('#tt-exit').addEventListener('click', exitTimeTravel);
 
-const TL_KIND_LABEL = { add: '新增', content: '修改', move: '移动', delete: '删除', mirror_add: '跟读' };
+const TL_KIND_LABEL = {
+  add: '新增', content: '修改', move: '移动', delete: '删除',
+  mirror_add: '跟读', excerpt_add: '摘录', excerpt_align: '摘录对齐',
+};
 
 function drawTimeline() {
   const list = $('#timeline-list');
@@ -2708,8 +3111,12 @@ function renderTimeNode(tt, id) {
 
 function renderTimeRow(node) {
   const el = document.createElement('div');
-  el.className = 'node tt-node' + (node.kind === 'mirror' ? ' mirror-node' : '');
-  if (node.kind === 'mirror' && node.sourceDeleted) el.classList.add('source-gone');
+  el.className = 'node tt-node' +
+    (node.kind === 'mirror' ? ' mirror-node' : '') +
+    (node.kind === 'excerpt' ? ' excerpt-node' : '');
+  if ((node.kind === 'mirror' || node.kind === 'excerpt') && node.sourceDeleted) {
+    el.classList.add('source-gone');
+  }
 
   const row = document.createElement('div');
   row.className = 'node-row';
@@ -2719,18 +3126,33 @@ function renderTimeRow(node) {
     content.className = 'node-content mirror-tombstone';
     content.innerHTML =
       '<span class="tombstone-mark">🪦</span> 该时刻源段落不存在（尚未创建或已被删除）';
+  } else if (node.kind === 'excerpt') {
+    // 回看时刻的摘录：展示它在 <= seq 最近一次冻结的正文（服务器已按时刻重建）
+    content.className = 'node-content excerpt-content';
+    content.textContent = node.content || '（空摘录）';
   } else {
     content.className = 'node-content' + (node.content ? '' : ' placeholder');
     content.textContent = node.content || '（空段落）';
   }
   row.appendChild(content);
 
-  // 「接着改」的入口：普通行看自己当前是否还活着；跟读行看源当前是否还活着
+  // 「接着改」的入口：普通行看自己当前是否还活着；跟读/摘录行看源当前是否还活着。
+  // 摘录是冻结副本，回看时刻不提供"接着改"，只给状态标签。
   const actions = document.createElement('div');
   actions.className = 'tt-actions';
-  const goneNow = node.kind === 'mirror' ? !node.sourceAliveNow : !node.aliveNow;
+  const goneNow = node.kind === 'mirror' ? !node.sourceAliveNow
+    : node.kind === 'excerpt' ? !node.sourceAliveNow
+    : !node.aliveNow;
   if (node.kind === 'mirror' && node.sourceDeleted) {
     // 当时源就不存在，无可接着改
+  } else if (node.kind === 'excerpt') {
+    const tag = document.createElement('span');
+    tag.className = 'tt-gone-tag';
+    if (node.sourceDeleted) tag.textContent = '源当时已删除（摘录冻结正文保留）';
+    else if (goneNow) tag.textContent = '源当前已删除';
+    else if (node.stale) tag.textContent = `该时刻摘录停在源 v${node.sourceVersion}（原文已到 v${node.currentSourceVersion}）`;
+    else tag.textContent = `该时刻摘录与原文 v${node.sourceVersion} 一致`;
+    actions.appendChild(tag);
   } else if (goneNow) {
     const tag = document.createElement('span');
     tag.className = 'tt-gone-tag';
@@ -2751,11 +3173,21 @@ function renderTimeRow(node) {
     tag.textContent = '🔗 跟读自：' + (srcDoc ? srcDoc.title : '另一份大纲');
     meta.appendChild(tag);
   }
-  const versionTag = document.createElement('span');
-  versionTag.className = 'version-tag';
-  versionTag.textContent = `当时 v${node.version ?? '—'}`;
-  meta.appendChild(versionTag);
-  if (node.author && !node.sourceDeleted) {
+  if (node.kind === 'excerpt') {
+    const tag = document.createElement('span');
+    tag.className = 'excerpt-tag';
+    const srcDoc = node.sourceDocId ? state.docs.get(node.sourceDocId) : null;
+    tag.textContent = '📌 摘录自：' + (srcDoc ? srcDoc.title : '另一份大纲') +
+      `（抄于源 v${node.sourceVersion ?? '—'}）`;
+    meta.appendChild(tag);
+  }
+  if (node.kind !== 'excerpt') {
+    const versionTag = document.createElement('span');
+    versionTag.className = 'version-tag';
+    versionTag.textContent = `当时 v${node.version ?? '—'}`;
+    meta.appendChild(versionTag);
+  }
+  if (node.kind !== 'excerpt' && node.author && !node.sourceDeleted) {
     const tag = document.createElement('span');
     tag.className = 'muted';
     tag.textContent = `${node.author} · ${fmtTime(node.updatedAt)}`;

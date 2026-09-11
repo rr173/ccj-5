@@ -29,10 +29,28 @@ function init(dbFile) {
       parent_id  TEXT,
       pos        TEXT NOT NULL DEFAULT '',
       mirror_of  TEXT,                       -- 非空 = 跟读段落，正文永远投影自该源节点
+      excerpt_of TEXT,                       -- 非空 = 摘录段落，正文是摘录时刻冻结的副本（不随源变）
       deleted    INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_nodes_doc ON nodes(doc_id, deleted);
+
+    -- 摘录（excerpt）：把某段在某一时刻的正文抄一份冻在这里。
+    -- 与跟读（mirror）相反，摘录不投影源：源之后怎么改，这行字都不变，
+    -- 直到有人显式「对齐到原文此刻」——对齐在一个事务里把新冻结副本写入
+    -- 新的一行（append-only，每次对齐留痕），并广播同一条 excerpt_aligned，
+    -- 所有正在看的人必然看到同一份。
+    CREATE TABLE IF NOT EXISTS excerpt_states (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      node_id        TEXT NOT NULL,         -- 摘录节点 id（nodes.excerpt_of 非空）
+      doc_id         TEXT NOT NULL,
+      content        TEXT NOT NULL,         -- 这次冻结下来的正文
+      source_version INTEGER NOT NULL,      -- 冻结时源段落的版本号（CAS 基准/陈旧判定）
+      author_id      TEXT NOT NULL DEFAULT '',
+      author         TEXT NOT NULL DEFAULT '',
+      created_at     INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_excerpt_node ON excerpt_states(node_id, id);
 
     -- 段落级 append-only 历史。当前内容 = 该 node 最新一条 revision。
     -- 跟读（mirror）节点自身没有 revision：它的内容是源节点 revision 的投影。
@@ -67,18 +85,21 @@ function init(dbFile) {
     CREATE INDEX IF NOT EXISTS idx_suggestions_node
       ON suggestions(node_id, status, created_at);
 
-    -- 整份大纲的 append-only 时间轴：结构（增/移/删/挂跟读）与内容（每次保存）
+    -- 整份大纲的 append-only 时间轴：结构（增/移/删/挂跟读/做摘录）与内容（每次保存）
     -- 共用同一个全局单调 seq，seq 就是"时刻"坐标。任意 seq 可确定性重建
-    -- 当时整棵树的层级 + 正文（跟读投影源在同一 seq 的内容），所有人看到
-    -- 的必然是同一份重建结果。
+    -- 当时整棵树的层级 + 正文（跟读投影源在同一 seq 的内容；摘录展示它在最近一次
+    -- excerpt_add/excerpt_align 时刻冻结的正文），所有人看到的必然是同一份重建结果。
     CREATE TABLE IF NOT EXISTS timeline (
       seq         INTEGER PRIMARY KEY AUTOINCREMENT,
       doc_id      TEXT NOT NULL,      -- 事件归属文档（内容事件 = 源节点所在文档）
-      kind        TEXT NOT NULL,      -- add | mirror_add | move | delete | content
+      kind        TEXT NOT NULL,      -- add | mirror_add | excerpt_add | excerpt_align | move | delete | content
       node_id     TEXT NOT NULL,      -- 主语节点（delete 时是删除起点）
-      parent_id   TEXT,               -- add/mirror_add/move：新父级
-      pos         TEXT,               -- add/mirror_add/move：新位置
+      parent_id   TEXT,               -- add/mirror_add/excerpt_add/move：新父级
+      pos         TEXT,               -- add/mirror_add/excerpt_add/move：新位置
       mirror_of   TEXT,               -- mirror_add：源节点
+      excerpt_of  TEXT,               -- excerpt_add：源节点
+      excerpt_content TEXT,           -- excerpt_add/excerpt_align：该时刻冻结的摘录正文
+      excerpt_source_version INTEGER, -- excerpt_add/excerpt_align：冻结所对齐到的源版本
       deleted_ids TEXT,               -- delete：JSON 数组（整棵子树）
       rev_id      INTEGER,            -- 该时刻生效的 revision（add 时为 v1）
       author      TEXT NOT NULL DEFAULT '',
@@ -110,12 +131,28 @@ function init(dbFile) {
     CREATE INDEX IF NOT EXISTS idx_publications_doc ON publications(doc_id, pub_seq);
   `);
 
-  // 旧库迁移：补 mirror_of 列（必须先于该列的索引创建）
+  // 旧库迁移：补 mirror_of / excerpt_of 列（必须先于该列的索引创建）
   const cols = db.prepare('PRAGMA table_info(nodes)').all();
   if (!cols.some((c) => c.name === 'mirror_of')) {
     db.exec('ALTER TABLE nodes ADD COLUMN mirror_of TEXT');
   }
+  if (!cols.some((c) => c.name === 'excerpt_of')) {
+    db.exec('ALTER TABLE nodes ADD COLUMN excerpt_of TEXT');
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_mirror ON nodes(mirror_of) WHERE mirror_of IS NOT NULL');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_excerpt ON nodes(excerpt_of) WHERE excerpt_of IS NOT NULL');
+
+  // 旧库迁移：timeline 补摘录相关列
+  const tlCols = db.prepare('PRAGMA table_info(timeline)').all();
+  if (!tlCols.some((c) => c.name === 'excerpt_of')) {
+    db.exec('ALTER TABLE timeline ADD COLUMN excerpt_of TEXT');
+  }
+  if (!tlCols.some((c) => c.name === 'excerpt_content')) {
+    db.exec('ALTER TABLE timeline ADD COLUMN excerpt_content TEXT');
+  }
+  if (!tlCols.some((c) => c.name === 'excerpt_source_version')) {
+    db.exec('ALTER TABLE timeline ADD COLUMN excerpt_source_version INTEGER');
+  }
 
   backfillTimeline(db);
   seedIfEmpty(db);
@@ -138,8 +175,7 @@ function backfillTimeline(db) {
   const ins = db.prepare(
     `INSERT INTO timeline (doc_id, kind, node_id, parent_id, pos, mirror_of, deleted_ids, rev_id, author, author_id, note, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
-  );
-  const revOf = db.prepare('SELECT * FROM revisions WHERE node_id = ? AND version = ?');
+  );  const revOf = db.prepare('SELECT * FROM revisions WHERE node_id = ? AND version = ?');
   const events = [];
   for (const n of db.prepare('SELECT * FROM nodes').all()) {
     const v1 = revOf.get(n.id, 1);
@@ -212,13 +248,18 @@ function seedIfEmpty(db) {
 // 追加一条时间轴事件（必须在调用方的事务里用，与数据写入同生共死）
 function logEvent(db, {
   docId, kind, nodeId, parentId = null, pos = null, mirrorOf = null,
+  excerptOf = null, excerptContent = null, excerptSourceVersion = null,
   deletedIds = null, revId = null, author = '', authorId = '', note = '', at = null,
 }) {
   db.prepare(
-    `INSERT INTO timeline (doc_id, kind, node_id, parent_id, pos, mirror_of, deleted_ids, rev_id, author, author_id, note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO timeline
+       (doc_id, kind, node_id, parent_id, pos, mirror_of, excerpt_of,
+        excerpt_content, excerpt_source_version, deleted_ids, rev_id,
+        author, author_id, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    docId, kind, nodeId, parentId, pos, mirrorOf,
+    docId, kind, nodeId, parentId, pos, mirrorOf, excerptOf,
+    excerptContent, excerptSourceVersion,
     deletedIds ? JSON.stringify(deletedIds) : null, revId,
     author, authorId, note, at ?? Date.now(),
   );
@@ -244,7 +285,8 @@ function createDocument(db, { id, title }) {
 
 // ---------- 读取 ----------
 
-// 当前快照：未删除节点；普通节点带最新 revision，跟读节点投影源节点正文。
+// 当前快照：未删除节点；普通节点带最新 revision，跟读节点投影源节点正文，
+// 摘录节点带它自己最近一次冻结的正文（excerpt_states 最新一行），绝不投影源。
 function getSnapshot(db, docId) {
   const doc = getDoc(db, docId);
   if (!doc) return null;
@@ -252,13 +294,14 @@ function getSnapshot(db, docId) {
   const own = db
     .prepare(
       `SELECT n.id, n.parent_id AS parentId, n.pos, n.mirror_of AS mirrorOf,
+              n.excerpt_of AS excerptOf,
               r.version, r.content, r.author, r.author_id AS authorId,
               r.created_at AS updatedAt
        FROM nodes n
        LEFT JOIN revisions r
          ON r.id = (SELECT id FROM revisions WHERE node_id = n.id
                     ORDER BY version DESC LIMIT 1)
-       WHERE n.doc_id = ? AND n.deleted = 0 AND n.mirror_of IS NULL
+       WHERE n.doc_id = ? AND n.deleted = 0 AND n.mirror_of IS NULL AND n.excerpt_of IS NULL
        ORDER BY n.parent_id, n.pos`,
     )
     .all(docId);
@@ -272,10 +315,26 @@ function getSnapshot(db, docId) {
     )
     .all(docId);
 
-  // 批量解析源节点（源可能在别的文档，也可能已被删除）
+  const excerpts = db
+    .prepare(
+      `SELECT n.id, n.parent_id AS parentId, n.pos, n.excerpt_of AS excerptOf,
+              s.content, s.source_version AS sourceVersion,
+              s.author, s.author_id AS authorId, s.created_at AS frozenAt
+       FROM nodes n
+       JOIN excerpt_states s
+         ON s.id = (SELECT id FROM excerpt_states WHERE node_id = n.id
+                    ORDER BY id DESC LIMIT 1)
+       WHERE n.doc_id = ? AND n.deleted = 0 AND n.excerpt_of IS NOT NULL
+       ORDER BY n.parent_id, n.pos`,
+    )
+    .all(docId);
+
+  // 批量解析源节点（源可能在别的文档，也可能已被删除）。
+  // 跟读与摘录共用同一份源解析：它们都引用一个普通源节点。
+  const refs = [...mirrors.map((m) => m.mirrorOf), ...excerpts.map((e) => e.excerptOf)];
+  const sourceIds = [...new Set(refs)];
   let sourceById = new Map();
-  if (mirrors.length) {
-    const sourceIds = [...new Set(mirrors.map((m) => m.mirrorOf))];
+  if (sourceIds.length) {
     const placeholders = sourceIds.map(() => '?').join(',');
     const sourceRows = db
       .prepare(
@@ -315,6 +374,37 @@ function getSnapshot(db, docId) {
     own.push(node);
   }
 
+  for (const e of excerpts) {
+    const src = sourceById.get(e.excerptOf);
+    const gone = !src || src.deleted;
+    const node = {
+      id: e.id,
+      parentId: e.parentId,
+      pos: e.pos,
+      kind: 'excerpt',
+      excerptOf: e.excerptOf,
+      sourceDocId: src ? src.docId : null,
+      // 冻结正文永远是摘录自己这一份，源改了也不变
+      content: e.content,
+      sourceVersion: e.sourceVersion,
+      version: e.sourceVersion, // 展示用：这份字抄自源的哪个版本
+      author: e.author,
+      authorId: e.authorId,
+      updatedAt: e.frozenAt,
+      frozenAt: e.frozenAt,
+      sourceDeleted: gone ? 1 : 0,
+    };
+    // 源还在：给出源当前版本，客户端据此判定"原文已改 / 已对齐"
+    if (!gone) {
+      node.currentSourceVersion = src.version;
+      node.stale = src.version !== e.sourceVersion ? 1 : 0;
+    } else {
+      node.currentSourceVersion = null;
+      node.stale = 0;
+    }
+    own.push(node);
+  }
+
   return { doc, nodes: own };
 }
 
@@ -333,7 +423,9 @@ function resolveSource(db, nodeId) {
   return cur && !cur.mirror_of ? cur : null;
 }
 
-// 挂了这些源节点跟读的（其它）文档 id 列表
+// 挂了这些源节点「跟读」的（其它）文档 id 列表：只有跟读需要源正文/锁的实时扇出。
+// 刻意不含摘录——摘录不投影源，源的 content 绝不进摘录宿主房间（协议层保证
+// "摘录这边不会悄悄换成新字"）；摘录只在显式对齐时收到自己那一条冻结结果。
 function mirrorHostDocs(db, sourceIds) {
   const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
   if (!ids.length) return [];
@@ -345,6 +437,40 @@ function mirrorHostDocs(db, sourceIds) {
     )
     .all(...ids);
   return rows.map((r) => r.docId);
+}
+
+// 仅挂了摘录的宿主文档（源删除时给它们发 excerpt 墓碑用）
+function excerptHostDocs(db, sourceIds) {
+  const ids = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT doc_id AS docId FROM nodes
+       WHERE deleted = 0 AND excerpt_of IN (${placeholders})`,
+    )
+    .all(...ids);
+  return rows.map((r) => r.docId);
+}
+
+function getLatestExcerptState(db, nodeId) {
+  return db
+    .prepare('SELECT * FROM excerpt_states WHERE node_id = ? ORDER BY id DESC LIMIT 1')
+    .get(nodeId);
+}
+
+function normalizeExcerptState(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    nodeId: row.node_id,
+    docId: row.doc_id,
+    content: row.content,
+    sourceVersion: row.source_version,
+    authorId: row.author_id,
+    author: row.author,
+    createdAt: row.created_at,
+  };
 }
 
 function getLatestRevision(db, nodeId) {
@@ -615,6 +741,98 @@ function addMirrorNode(db, { id, docId, parentId, pos, mirrorOf, userId = '', us
   })();
 }
 
+// 做一个摘录节点：把源此刻的正文抄一份冻进 excerpt_states。
+// 与跟读相反，摘录不投影源——这行字从此独立，直到显式对齐。
+function addExcerptNode(db, { id, docId, parentId, pos, excerptOf, userId = '', userName = '' }) {
+  return db.transaction(() => {
+    const source = getNode(db, excerptOf);
+    if (!source || source.deleted) return { status: 'missing' };
+    if (source.mirror_of || source.excerpt_of) return { status: 'bad_source' };
+    const srcRev = getLatestRevision(db, excerptOf);
+    if (!srcRev) return { status: 'missing' };
+
+    const now = Date.now();
+    db.prepare(
+      'INSERT INTO nodes (id, doc_id, parent_id, pos, excerpt_of, deleted, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
+    ).run(id, docId, parentId, pos, excerptOf, now);
+    db.prepare(
+      `INSERT INTO excerpt_states (node_id, doc_id, content, source_version, author_id, author, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, docId, srcRev.content, srcRev.version, userId, userName, now);
+    logEvent(db, {
+      docId, kind: 'excerpt_add', nodeId: id, parentId, pos, excerptOf,
+      excerptContent: srcRev.content, excerptSourceVersion: srcRev.version,
+      author: userName, authorId: userId, note: `摘录自源 v${srcRev.version}`, at: now,
+    });
+    bumpTreeRev(db, docId, now);
+    const node = getSnapshot(db, docId).nodes.find((n) => n.id === id);
+    return { status: 'created', node, treeRev: getDoc(db, docId).tree_rev };
+  })();
+}
+
+// 把摘录对齐到源此刻的正文。
+//
+// 并发安全（CAS）：请求必须带 baseSourceVersion——对齐者在确认弹窗里看到、
+// 并明确要对齐过去的那个"源当前版本"。事务内与源的真实当前版本比对：
+//   - 一致：把源当前正文冻结成 excerpt_states 的新一行（append-only 留痕），
+//     返回 aligned；调用方随后广播同一条 excerpt_aligned，全员看到同一份字。
+//   - 不一致：说明在 TA 确认期间源又被改过（另一个人几乎同时对齐、或源又被编辑），
+//     返回 stale 并带回源此刻真正的版本/正文——绝不允许"两边都显示对齐成功，
+//     冻的却不是同一句话"。前端据此让用户看清新原文后重新确认再对齐。
+//   - 源已删/摘录已删：missing/gone，冻字保持上一份不动。
+// 不改 tree_rev：对齐是内容冻结，不动结构。
+function alignExcerpt(db, { nodeId, baseSourceVersion, userId = '', userName = '' }) {
+  return db.transaction(() => {
+    const node = getNode(db, nodeId);
+    if (!node || node.deleted || !node.excerpt_of) return { status: 'missing' };
+    const source = getNode(db, node.excerpt_of);
+    if (!source || source.deleted) {
+      return { status: 'source_gone', frozen: normalizeExcerptState(getLatestExcerptState(db, nodeId)) };
+    }
+    const srcRev = getLatestRevision(db, node.excerpt_of);
+    if (!srcRev) return { status: 'source_gone' };
+
+    if (!Number.isInteger(baseSourceVersion) || baseSourceVersion < 1) {
+      return { status: 'bad_base', current: normalizeRevision(srcRev) };
+    }
+    if (srcRev.version !== baseSourceVersion) {
+      // 别人先对齐了 / 源又被改：把此刻真正的原文带回去重确认
+      return {
+        status: 'stale',
+        current: normalizeRevision(srcRev),
+        frozen: normalizeExcerptState(getLatestExcerptState(db, nodeId)),
+      };
+    }
+
+    const frozen = getLatestExcerptState(db, nodeId);
+    if (frozen && frozen.content === srcRev.content) {
+      // 字已经就是这份（例如源改了又改回原样）：幂等收敛，不新增冻结行
+      return {
+        status: 'unchanged',
+        state: normalizeExcerptState(frozen),
+        current: normalizeRevision(srcRev),
+      };
+    }
+
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `INSERT INTO excerpt_states (node_id, doc_id, content, source_version, author_id, author, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(nodeId, node.doc_id, srcRev.content, srcRev.version, userId, userName, now);
+    const state = normalizeExcerptState(
+      db.prepare('SELECT * FROM excerpt_states WHERE id = ?').get(info.lastInsertRowid),
+    );
+    logEvent(db, {
+      docId: node.doc_id, kind: 'excerpt_align', nodeId, excerptOf: node.excerpt_of,
+      excerptContent: srcRev.content, excerptSourceVersion: srcRev.version,
+      author: userName, authorId: userId, note: `摘录对齐到源 v${srcRev.version}`, at: now,
+    });
+    return { status: 'aligned', state, current: normalizeRevision(srcRev) };
+  })();
+}
+
 function bumpTreeRev(db, docId, now = Date.now()) {
   db.prepare('UPDATE documents SET tree_rev = tree_rev + 1, updated_at = ? WHERE id = ?').run(
     now,
@@ -652,7 +870,7 @@ function moveNode(db, { nodeId, parentId, pos, treeRev, userId = '', userName = 
 }
 
 // 软删除节点及其所有后代。
-// 普通节点：连带子树；跟读节点：没有子级（创建时禁止），只移除这一处挂载，源不受影响。
+// 普通节点：连带子树；跟读/摘录节点：没有子级（创建时禁止），只移除这一处挂载/摘录，源不受影响。
 function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
   return db.transaction(() => {
     const node = getNode(db, nodeId);
@@ -683,14 +901,16 @@ function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
     logEvent(db, {
       docId: doc.id, kind: 'delete', nodeId, deletedIds: ids,
       author: userName, authorId: userId,
-      note: node.mirror_of ? '移除跟读' : `删除段落（含子树共 ${ids.length} 段）`,
+      note: node.mirror_of ? '移除跟读'
+        : node.excerpt_of ? '移除摘录'
+        : `删除段落（含子树共 ${ids.length} 段）`,
     });
     bumpTreeRev(db, doc.id);
     return {
       status: 'deleted',
       ids,
       treeRev: getDoc(db, doc.id).tree_rev,
-      kind: node.mirror_of ? 'mirror' : 'node',
+      kind: node.mirror_of ? 'mirror' : node.excerpt_of ? 'excerpt' : 'node',
       supersededSuggestions: supersededSuggestionIds.map((id) => getSuggestion(db, id)),
     };
   })();
@@ -726,6 +946,8 @@ function getTimeline(db, limit = 300) {
     if (r.kind === 'add') summary = `新增段落「${clip(r.revContent)}」`;
     else if (r.kind === 'content') summary = `修改段落「${clip(r.revContent)}」`;
     else if (r.kind === 'mirror_add') summary = '挂载跟读';
+    else if (r.kind === 'excerpt_add') summary = '做了一处摘录（冻结当前正文）';
+    else if (r.kind === 'excerpt_align') summary = '摘录对齐到原文最新版本';
     else if (r.kind === 'move') summary = '移动段落 / 调整层级';
     else if (r.kind === 'delete') {
       summary = `删除段落（共 ${(JSON.parse(r.deletedIds || '[]')).length} 段）`;
@@ -749,20 +971,36 @@ function getSnapshotAt(db, docId, seq) {
     ? db.prepare('SELECT created_at AS createdAt FROM timeline WHERE seq = ?').get(at)
     : null;
 
-  // 1) 结构：全局重放（跟读源可能在别的大纲，必须一起重放才知道源当时是否存活）
+  // 1) 结构：全局重放（跟读/摘录源可能在别的大纲，必须一起重放才知道源当时是否存活）
   const structEvents = db
     .prepare(
       `SELECT kind, node_id AS nodeId, doc_id AS docId, parent_id AS parentId, pos,
-              mirror_of AS mirrorOf, deleted_ids AS deletedIds
+              mirror_of AS mirrorOf, excerpt_of AS excerptOf,
+              excerpt_content AS excerptContent,
+              excerpt_source_version AS excerptSourceVersion,
+              deleted_ids AS deletedIds
        FROM timeline WHERE kind != 'content' AND seq <= ? ORDER BY seq`,
     )
     .all(at);
-  const tree = new Map(); // nodeId -> { docId, parentId, pos, mirrorOf, deleted }
+  const tree = new Map(); // nodeId -> { docId, parentId, pos, mirrorOf, excerptOf, frozen, frozenVer, deleted }
   for (const e of structEvents) {
     if (e.kind === 'add' || e.kind === 'mirror_add') {
       tree.set(e.nodeId, {
-        docId: e.docId, parentId: e.parentId, pos: e.pos, mirrorOf: e.mirrorOf, deleted: 0,
+        docId: e.docId, parentId: e.parentId, pos: e.pos,
+        mirrorOf: e.mirrorOf, excerptOf: null, deleted: 0,
       });
+    } else if (e.kind === 'excerpt_add') {
+      tree.set(e.nodeId, {
+        docId: e.docId, parentId: e.parentId, pos: e.pos,
+        mirrorOf: null, excerptOf: e.excerptOf,
+        frozen: e.excerptContent, frozenVer: e.excerptSourceVersion, deleted: 0,
+      });
+    } else if (e.kind === 'excerpt_align') {
+      const n = tree.get(e.nodeId);
+      if (n && !n.deleted) {
+        n.frozen = e.excerptContent;
+        n.frozenVer = e.excerptSourceVersion;
+      }
     } else if (e.kind === 'move') {
       const n = tree.get(e.nodeId);
       if (n && !n.deleted) {
@@ -800,7 +1038,7 @@ function getSnapshotAt(db, docId, seq) {
   const nodes = [];
   for (const [id, n] of tree) {
     if (n.docId !== docId || n.deleted) continue;
-    if (!n.mirrorOf) {
+    if (!n.mirrorOf && !n.excerptOf) {
       const c = contentAt.get(id);
       nodes.push({
         id, parentId: n.parentId, pos: n.pos, kind: 'node',
@@ -811,6 +1049,29 @@ function getSnapshotAt(db, docId, seq) {
         updatedAt: c ? c.updatedAt : null,
         aliveNow: aliveNow.has(id) ? 1 : 0,
       });
+    } else if (n.excerptOf) {
+      // 摘录：展示该时刻最近一次冻结的正文，绝不投影源
+      const src = tree.get(n.excerptOf);
+      const gone = !src || src.deleted;
+      const node = {
+        id, parentId: n.parentId, pos: n.pos, kind: 'excerpt', excerptOf: n.excerptOf,
+        content: n.frozen ?? '',
+        sourceVersion: n.frozenVer ?? 0,
+        version: n.frozenVer ?? 0,
+        sourceDocId: src ? src.docId : null,
+        sourceDeleted: gone ? 1 : 0,
+        aliveNow: aliveNow.has(id) ? 1 : 0,
+        sourceAliveNow: aliveNow.has(n.excerptOf) ? 1 : 0,
+      };
+      if (!gone) {
+        const c = contentAt.get(n.excerptOf);
+        node.currentSourceVersion = c ? c.version : 0;
+        node.stale = c && c.version !== n.frozenVer ? 1 : 0;
+      } else {
+        node.currentSourceVersion = null;
+        node.stale = 0;
+      }
+      nodes.push(node);
     } else {
       const src = tree.get(n.mirrorOf);
       const gone = !src || src.deleted;
@@ -900,6 +1161,13 @@ function freezeSnapshot(db, docId, tlSeq) {
       row.sourceDocId = n.sourceDocId || null;
       row.sourceDeleted = n.sourceDeleted ? 1 : 0;
     }
+    if (n.kind === 'excerpt') {
+      // 摘录在定稿里自包含：冻的是发布时刻这行自己的字，源以后怎么改都与它无关
+      row.excerptOf = n.excerptOf;
+      row.sourceDocId = n.sourceDocId || null;
+      row.sourceDeleted = n.sourceDeleted ? 1 : 0;
+      row.sourceVersion = n.sourceVersion;
+    }
     if (typeof n.content === 'string') {
       row.content = n.content;
       row.version = n.version;
@@ -915,7 +1183,8 @@ function sameFrozenNodes(a, b) {
     const m = b[i];
     return n.id === m.id && n.parentId === m.parentId && n.pos === m.pos &&
       n.kind === m.kind && (n.content || '') === (m.content || '') &&
-      (n.sourceDeleted || 0) === (m.sourceDeleted || 0);
+      (n.sourceDeleted || 0) === (m.sourceDeleted || 0) &&
+      (n.kind === 'excerpt' ? (n.sourceVersion || 0) === (m.sourceVersion || 0) : true);
   });
 }
 
@@ -970,10 +1239,12 @@ module.exports = {
   getNode,
   resolveSource,
   mirrorHostDocs,
+  excerptHostDocs,
   getLatestRevision,
   getRevision,
   getRevisionByVersion,
   getHistory,
+  getLatestExcerptState,
   getSuggestion,
   listPendingSuggestions,
   createSuggestion,
@@ -982,6 +1253,8 @@ module.exports = {
   saveContent,
   addNode,
   addMirrorNode,
+  addExcerptNode,
+  alignExcerpt,
   moveNode,
   deleteNode,
   latestSeq,

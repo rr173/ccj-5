@@ -188,6 +188,38 @@ button.danger { color: var(--danger); border-color: #f3c0c0; }
 .tombstone-sub {
   font-weight: 400; font-size: 12px; color: var(--muted); margin-top: 2px;
 }
+
+/* 摘录段落：冻住的副本，左侧色条提醒"这是抄下来的字" */
+.node.excerpt-node {
+  border-left: 3px solid #b45309;
+  background: #fdfaf3;
+}
+.node.excerpt-node.excerpt-stale {
+  border-left-color: #c2410c;
+  background: #fef6ec;
+}
+.excerpt-content {
+  white-space: pre-wrap;
+  border-left: 2px solid #e7d3ae;
+  padding-left: 10px;
+}
+.excerpt-source-gone { opacity: .8; }
+.excerpt-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #92400e;
+  background: #f6ecd9; border-radius: 999px; padding: 1px 10px;
+}
+.excerpt-badge {
+  display: inline-flex; align-items: center;
+  font-size: 11px; border-radius: 999px; padding: 1px 10px;
+}
+.excerpt-badge.fresh { color: #166534; background: #e8f5ec; }
+.excerpt-badge.stale {
+  color: #9a3412; background: #fde7d3; cursor: pointer;
+}
+.excerpt-badge.stale:hover { background: #fbd9b8; }
+.excerpt-badge.gone { color: #9a3412; background: #fbe3e1; }
+#excerpt-align-btn.busy { opacity: .6; pointer-events: none; }
 button.danger-text { color: var(--danger); }
 .node.flash-source { animation: flash-source 2s ease; }
 @keyframes flash-source {
@@ -365,6 +397,7 @@ button.danger-text { color: var(--danger); }
 .tl-kind.move { background: #f3e8fd; color: #7c3aed; }
 .tl-kind.delete { background: #fdeaea; color: #b91c1c; }
 .tl-kind.mirror_add { background: #eef1fc; color: #3949ab; }
+.tl-kind.excerpt_add, .tl-kind.excerpt_align { background: #f6ecd9; color: #92400e; }
 .tl-doc { font-size: 11px; color: var(--muted); }
 
 /* 回看模式 */

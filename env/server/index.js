@@ -196,6 +196,9 @@ function audienceDocIds(sourceIds) {
 function resolveEditable(nodeId) {
   const row = store.getNode(db, nodeId);
   if (!row || row.deleted) return { error: '该段落已被删除' };
+  if (row.excerpt_of) {
+    return { error: '摘录是冻结的副本，不能直接改；请点「对齐到原文」更新它，或去源段落编辑' };
+  }
   if (row.mirror_of) {
     const source = store.resolveSource(db, nodeId);
     if (!source || source.deleted) return { error: '跟读的源段落已被删除' };
@@ -253,6 +256,7 @@ function visibleSourceIds(nodes) {
   const sourceIds = new Set();
   for (const n of nodes) {
     if (n.kind === 'mirror') sourceIds.add(n.mirrorOf);
+    else if (n.kind === 'excerpt') sourceIds.add(n.excerptOf);
     else sourceIds.add(n.id);
   }
   return sourceIds;
@@ -885,8 +889,14 @@ function handleSave(peer, msg) {
   }
 
   const node = store.getNode(db, nodeId);
-  if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
+  if (!node || node.deleted || node.mirror_of || node.excerpt_of) {
+    send(peer, {
+      type: 'error', nodeId,
+      message: node && node.excerpt_of
+        ? '摘录是冻结的副本，不能直接改；请点「对齐到原文」或去源段落编辑'
+        : '该段落已被删除',
+      clientTag,
+    });
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
@@ -1002,8 +1012,12 @@ function handleRestoreSave(peer, msg) {
   }
 
   const node = store.getNode(db, nodeId);
-  if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
+  if (!node || node.deleted || node.mirror_of || node.excerpt_of) {
+    send(peer, {
+      type: 'error', nodeId,
+      message: node && node.excerpt_of ? '摘录是冻结副本，不能编辑或接着改' : '该段落已被删除',
+      clientTag,
+    });
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
@@ -1106,8 +1120,12 @@ function handleResolve(peer, msg) {
   const content = String(msg.content ?? '').slice(0, 100_000);
   const clientTag = clientTagOf(msg);
   const node = store.getNode(db, nodeId);
-  if (!node || node.deleted || node.mirror_of) {
-    send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
+  if (!node || node.deleted || node.mirror_of || node.excerpt_of) {
+    send(peer, {
+      type: 'error', nodeId,
+      message: node && node.excerpt_of ? '摘录是冻结副本，不能直接提交正文' : '该段落已被删除',
+      clientTag,
+    });
     return;
   }
   if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
@@ -1144,8 +1162,8 @@ function handleAdd(peer, msg) {
       send(peer, { type: 'error', message: '父级段落不存在' });
       return;
     }
-    if (parent.mirror_of) {
-      send(peer, { type: 'error', message: '跟读段落下不能再加子级' });
+    if (parent.mirror_of || parent.excerpt_of) {
+      send(peer, { type: 'error', message: '跟读/摘录是引用行，其下不能再加子级' });
       return;
     }
     docId = parent.doc_id;
@@ -1191,8 +1209,8 @@ function handleAddMirror(peer, msg) {
   const afterId = msg.afterId ? String(msg.afterId || '') : null;
 
   const source = store.getNode(db, sourceId);
-  if (!source || source.deleted || source.mirror_of) {
-    send(peer, { type: 'error', message: '源段落不存在或已删除' });
+  if (!source || source.deleted || source.mirror_of || source.excerpt_of) {
+    send(peer, { type: 'error', message: '源段落不存在或已删除（只能挂普通段落）' });
     return;
   }
   const hostDoc = store.getDoc(db, hostDocId);
@@ -1211,8 +1229,8 @@ function handleAddMirror(peer, msg) {
       send(peer, { type: 'error', message: '挂载位置无效' });
       return;
     }
-    if (parent.mirror_of) {
-      send(peer, { type: 'error', message: '跟读段落下不能再挂跟读' });
+    if (parent.mirror_of || parent.excerpt_of) {
+      send(peer, { type: 'error', message: '跟读/摘录是引用行，其下不能再挂' });
       return;
     }
   }
@@ -1234,6 +1252,162 @@ function handleAddMirror(peer, msg) {
     node: added.node,
     treeRev: added.treeRev,
     by: peer.user.userId,
+  });
+}
+
+// 做一处摘录：把源此刻的正文抄一份冻进目标大纲。与跟读相反，
+// 摘录不投影源——源之后怎么改，这行字都不变，直到有人显式对齐。
+function handleAddExcerpt(peer, msg) {
+  const sourceId = String(msg.sourceId || '');
+  const hostDocId = String(msg.docId || '');
+  const parentId = msg.parentId ? String(msg.parentId) : null;
+  const afterId = msg.afterId ? String(msg.afterId || '') : null;
+
+  const source = store.getNode(db, sourceId);
+  if (!source || source.deleted || source.mirror_of || source.excerpt_of) {
+    send(peer, { type: 'error', message: '源段落不存在或已删除（只能摘录普通段落）' });
+    return;
+  }
+  const hostDoc = store.getDoc(db, hostDocId);
+  if (!hostDoc) {
+    send(peer, { type: 'error', message: '目标大纲不存在' });
+    return;
+  }
+  if (!denyWriteWhileFollowing(peer, hostDocId)) return;
+  if (Number(msg.treeRev) !== hostDoc.tree_rev) {
+    sendStale(peer, hostDoc);
+    return;
+  }
+  if (parentId) {
+    const parent = store.getNode(db, parentId);
+    if (!parent || parent.deleted || parent.doc_id !== hostDocId) {
+      send(peer, { type: 'error', message: '放置位置无效' });
+      return;
+    }
+    if (parent.mirror_of || parent.excerpt_of) {
+      send(peer, { type: 'error', message: '跟读/摘录是引用行，其下不能再放摘录' });
+      return;
+    }
+  }
+
+  const pos = computePosAfter(db, hostDocId, parentId, afterId);
+  const newId = crypto.randomUUID();
+  const result = store.addExcerptNode(db, {
+    id: newId,
+    docId: hostDocId,
+    parentId,
+    pos,
+    excerptOf: sourceId,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status !== 'created') {
+    send(peer, { type: 'error', message: '源段落不可摘录' });
+    return;
+  }
+  sendToDoc(hostDocId, {
+    type: 'excerpt_added',
+    docId: hostDocId,
+    node: result.node,
+    treeRev: result.treeRev,
+    by: peer.user.userId,
+  });
+}
+
+// 把摘录对齐到源此刻的正文。
+//
+// 关键语义（与定稿 CAS、讲解交棒同一思路）：
+// - 服务器是唯一事实源：对齐在单个 SQLite 事务里冻结新正文并写时间轴，
+//   成功后广播同一条 excerpt_aligned，所有观看者（含发起者的其他标签页）
+//   逐字收到同一份冻结结果，不存在"各对齐各的"。
+// - 请求必须带 baseSourceVersion（用户在确认弹窗里看到、明确要对齐过去的
+//   源版本）。两个人几乎同时点对齐、各自屏幕上认定的"原文当前版本"还不一样时，
+//   后到者事务内发现源已经又往前走了，只收到 excerpt_align_stale + 此刻真正的
+//   原文，冻字维持上一份不动；TA 看清新原文再确认后才能对齐成功——
+//   绝不可能"两边都提示对齐成功，冻住的字却不一样"。
+// - 取消/关掉确认弹窗根本不会发这条消息：什么都不发生，摘录还是上一份冻字。
+function handleAlignExcerpt(peer, msg) {
+  const nodeId = String(msg.nodeId || '');
+  const baseSourceVersion = Number(msg.baseSourceVersion);
+  const row = store.getNode(db, nodeId);
+  if (!row || row.deleted || !row.excerpt_of) {
+    send(peer, { type: 'error', nodeId, message: '摘录不存在或已被移除' });
+    return;
+  }
+  const docId = row.doc_id;
+  if (!denyWriteWhileFollowing(peer, docId)) return;
+  const result = store.alignExcerpt(db, {
+    nodeId,
+    baseSourceVersion,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', nodeId, message: '摘录不存在或已被移除' });
+    return;
+  }
+  if (result.status === 'bad_base') {
+    send(peer, { type: 'error', nodeId, message: '缺少要对齐到的源版本号' });
+    return;
+  }
+  if (result.status === 'source_gone') {
+    // 源没了：冻字保持不动（客户端应显示墓碑链接，不再允许对齐）
+    send(peer, {
+      type: 'excerpt_align_gone',
+      nodeId,
+      message: '源段落已被删除，无法对齐；摘录仍保留最后一次冻结的正文',
+    });
+    return;
+  }
+  if (result.status === 'stale') {
+    // 并发输了/源又被改：把此刻真正的原文带回去重确认，冻字不变
+    send(peer, {
+      type: 'excerpt_align_stale',
+      nodeId,
+      baseSourceVersion,
+      current: {
+        version: result.current.version,
+        content: result.current.content,
+        author: result.current.author,
+        created_at: result.current.created_at,
+      },
+      frozen: result.frozen
+        ? { sourceVersion: result.frozen.sourceVersion, content: result.frozen.content }
+        : null,
+      message: '你确认期间原文又有了新版本，请看一眼此刻的原文再决定是否对齐；摘录仍是上一版冻结内容',
+    });
+    return;
+  }
+  if (result.status === 'unchanged') {
+    send(peer, {
+      type: 'excerpt_align_ack',
+      nodeId,
+      unchanged: true,
+      sourceVersion: result.state.sourceVersion,
+      content: result.state.content,
+      message: '原文与摘录内容相同，无需更新',
+    });
+    return;
+  }
+
+  // aligned：全员（含其他标签页里的自己）收到同一条冻结结果
+  sendToDoc(docId, {
+    type: 'excerpt_aligned',
+    docId,
+    nodeId,
+    excerptOf: row.excerpt_of,
+    content: result.state.content,
+    sourceVersion: result.state.sourceVersion,
+    currentSourceVersion: result.current.version,
+    frozenAt: result.state.createdAt,
+    by: { userId: peer.user.userId, userName: peer.user.userName },
+  });
+  // 发起者本人：再给一条回执（对齐按钮解除忙碌态）。不含新内容，
+  // 内容以上面那条广播（同样会发到发起者所在房间）为准，保证只有一份事实。
+  send(peer, {
+    type: 'excerpt_align_ack',
+    nodeId,
+    sourceVersion: result.state.sourceVersion,
   });
 }
 
@@ -1279,8 +1453,8 @@ function handleMove(peer, msg) {
       send(peer, { type: 'error', nodeId, message: '移动目标不在同一份大纲里' });
       return;
     }
-    if (target.mirror_of) {
-      send(peer, { type: 'error', nodeId, message: '跟读段落下不能挂子级' });
+    if (target.mirror_of || target.excerpt_of) {
+      send(peer, { type: 'error', nodeId, message: '跟读/摘录是引用行，其下不能挂子级' });
       return;
     }
   }
@@ -1336,8 +1510,8 @@ function handleDelete(peer, msg) {
     return;
   }
 
-  // 跟读行：只摘掉这一处挂载，源段落与别处跟读都不受影响
-  if (row.mirror_of) {
+  // 跟读/摘录行：只摘掉这一处挂载/摘录，源段落与别处引用都不受影响
+  if (row.mirror_of || row.excerpt_of) {
     const result = store.deleteNode(db, {
       nodeId, treeRev: Number(msg.treeRev),
       userId: peer.user.userId, userName: peer.user.userName,
@@ -1377,6 +1551,12 @@ function handleDelete(peer, msg) {
   const hostDocs = store.mirrorHostDocs(db, result.ids);
   for (const hostDocId of hostDocs) {
     sendToDoc(hostDocId, { type: 'source_deleted', sourceIds: result.ids });
+  }
+  // 摘录：源没了也不能假装还能对齐——冻结正文保留（那是摘那一刻的字），
+  // 但标记"源已删除"，对齐入口失效。
+  const excerptDocs = store.excerptHostDocs(db, result.ids);
+  for (const hostDocId of excerptDocs) {
+    sendToDoc(hostDocId, { type: 'excerpt_source_deleted', sourceIds: result.ids });
   }
   for (const suggestion of result.supersededSuggestions || []) {
     if (suggestion?.nodeId) {
@@ -1427,6 +1607,8 @@ wss.on('connection', (ws) => {
         case 'leave_published': handleLeavePublished(peer, msg); break;
         case 'publish': handlePublish(peer, msg); break;
         case 'add_mirror': handleAddMirror(peer, msg); break;
+        case 'add_excerpt': handleAddExcerpt(peer, msg); break;
+        case 'excerpt_align': handleAlignExcerpt(peer, msg); break;
         case 'lock': handleLock(peer, msg); break;
         case 'unlock': handleUnlock(peer, msg); break;
         case 'heartbeat': handleHeartbeat(peer, msg); break;

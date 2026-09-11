@@ -206,12 +206,14 @@ function renderOutline(host, nodes) {
       outer.style.marginLeft = depth ? '0' : '0';
 
       const row = document.createElement('div');
-      row.className = 'node pub-node';
+      row.className = 'node pub-node' +
+        (node.kind === 'mirror' ? ' mirror-node' : '') +
+        (node.kind === 'excerpt' ? ' excerpt-node' : '');
 
       const body = document.createElement('div');
       body.className = 'node-body';
       const text = document.createElement('div');
-      text.className = 'node-text';
+      text.className = 'node-text' + (node.kind === 'excerpt' ? ' excerpt-content' : '');
       if (node.kind === 'mirror' && node.sourceDeleted) {
         text.innerHTML = '<span class="pub-gone">（源段落在定稿时已删除）</span>';
       } else {
@@ -222,6 +224,14 @@ function renderOutline(host, nodes) {
         const tag = document.createElement('span');
         tag.className = 'pub-mirror-tag';
         tag.textContent = '跟读';
+        body.appendChild(tag);
+      }
+      if (node.kind === 'excerpt') {
+        const tag = document.createElement('span');
+        tag.className = 'excerpt-tag';
+        tag.textContent = node.sourceDeleted
+          ? '📌 摘录（源已删除，保留冻结正文）'
+          : `📌 摘录（抄于源 v${node.version ?? '—'}）`;
         body.appendChild(tag);
       }
       row.appendChild(body);

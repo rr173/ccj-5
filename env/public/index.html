@@ -116,6 +116,50 @@
     </div>
   </div>
 
+  <!-- 做摘录弹窗：把源此刻的字抄一份冻到目标大纲 -->
+  <div id="excerpt-mask" class="conflict-mask hidden">
+    <div class="newdoc-card">
+      <h3>把这一段摘录一份</h3>
+      <p class="muted" id="excerpt-help">
+        摘录会把这一段此刻的正文原样抄一份冻在目标大纲里。源以后再改，摘录不会自动变；
+        需要时点摘录上的「对齐到原文」并确认，才会更新成源当时的字。
+      </p>
+      <label class="final-label">摘录到哪份大纲
+        <select id="excerpt-doc-select"></select>
+      </label>
+      <div class="conflict-actions">
+        <button id="excerpt-cancel" class="ghost">取消</button>
+        <button id="excerpt-confirm" class="primary">摘录一份并打开那份大纲</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 摘录对齐确认弹窗：不点确认绝不发 excerpt_align，反悔零成本 -->
+  <div id="excerpt-align-mask" class="conflict-mask hidden">
+    <div class="conflict-card">
+      <h3 id="ea-title">把摘录对齐到原文此刻？</h3>
+      <p class="muted">
+        对齐只发生在你点「确认对齐」之后：服务器会把原文此刻的正文冻成摘录的新一份，
+        所有正在看的人立刻看到<b>同一份字</b>。取消或关掉窗口什么都不会发生，摘录仍是上一版冻住的内容。
+        若你确认期间原文又被改了，会先把<b>此刻真正的原文</b>摆给你重看一遍再确认，不会悄悄对齐到别的字。
+      </p>
+      <div class="conflict-cols">
+        <label><span id="ea-frozen-version">摘录当前内容</span>
+          <textarea id="ea-frozen" rows="8" readonly></textarea>
+        </label>
+        <label><span id="ea-source-version">原文此刻</span>
+          <textarea id="ea-source" rows="8" readonly></textarea>
+        </label>
+      </div>
+      <p id="ea-same" class="muted hidden" style="margin:6px 0">两边内容逐字相同：对齐不会改变摘录的字，只会把基准版本更新到原文当前版本。</p>
+      <p id="ea-diff" class="muted" style="margin:6px 0">左边是摘录冻着的旧字，右边是原文此刻的字。确认后左边整份换成右边，全员同步。</p>
+      <div class="conflict-actions">
+        <button id="excerpt-align-cancel" class="ghost">取消（摘录保持上一版冻字）</button>
+        <button id="excerpt-align-btn" class="primary">确认对齐</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 提出改写弹窗 -->
   <div id="suggestion-mask" class="conflict-mask hidden">
     <form id="suggestion-form" class="newdoc-card suggestion-card">
