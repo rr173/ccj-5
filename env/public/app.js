@@ -400,6 +400,11 @@ const timelineCache = { items: [], latestSeq: 0 };
 // key: docId -> { pubSeq, title, by:{userId,userName}, createdAt, timelineSeq } | null
 const publishedByDoc = new Map();
 
+// 当前每份大纲的讲解轮次：服务器是唯一事实源，客户端不做乐观抢占。
+// value: { leader:{userId,userName,color}, nodeId, offer:{userId,userName}|null } | null
+const presentationByDoc = new Map();
+const presentFollowLock = { timer: 0 };
+
 const $ = (sel) => document.querySelector(sel);
 
 /* ================= 工具 ================= */
@@ -456,6 +461,14 @@ function viewOf(docId) {
   return state.views.get(docId);
 }
 
+function currentPresentation(docId = state.activeDocId) {
+  return presentationByDoc.get(docId) || null;
+}
+
+function amPresentationLeader(p = currentPresentation()) {
+  return !!(p && state.me && p.leader.userId === state.me.userId);
+}
+
 function findRow(nodeId) {
   for (const v of state.views.values()) {
     if (v.nodes.has(nodeId)) return { view: v, node: v.nodes.get(nodeId) };
@@ -499,6 +512,34 @@ function removeProposals(sourceId, suggestionIds = []) {
   for (const id of suggestionIds) changed = (map?.delete(id) || false) || changed;
   if (changed) patchSource(sourceId);
 }
+
+function mustFollowPresentation() {
+  const p = currentPresentation();
+  return !!p && !amPresentationLeader(p) && !timeTravel.active &&
+    !!viewOf(state.activeDocId) && !!state.me;
+}
+
+function isEditableTarget(target) {
+  return !!(target && target.closest?.('textarea, input, select, [contenteditable="true"]'));
+}
+
+const PRESENT_SCROLL_KEYS = new Set([
+  ' ', 'PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown',
+  'ArrowLeft', 'ArrowRight',
+]);
+
+for (const type of ['wheel', 'keydown', 'touchmove']) {
+  window.addEventListener(type, (e) => {
+    if (!mustFollowPresentation() || isEditableTarget(e.target)) return;
+    if (type === 'keydown' && !PRESENT_SCROLL_KEYS.has(e.key)) return;
+    e.preventDefault();
+    followPresentation({ force: true, flash: false });
+  }, { passive: false, capture: true });
+}
+window.addEventListener('scroll', (e) => {
+  if (!mustFollowPresentation() || isEditableTarget(e.target)) return;
+  followPresentation({ flash: false });
+}, { passive: true, capture: true });
 
 /* ================= 登录 ================= */
 
@@ -553,6 +594,10 @@ window.addEventListener('hashchange', async () => {
   if (!state.me) return;
   const route = parseHash();
   if (route) {
+    if (mustFollowPresentation() && route.nodeId) {
+      followPresentation({ force: true });
+      return;
+    }
     const ok = await ensureOpen(route.docId);
     if (!ok) return;
     activateTab(route.docId);
@@ -657,6 +702,15 @@ function requireOnline() {
   return false;
 }
 
+// 讲解轮次中只有讲解者能改正文/结构；其他人被锁定在同一阅读位置。
+function requirePresenterForEdit() {
+  const p = currentPresentation();
+  if (!p || amPresentationLeader(p)) return true;
+  toast(`${p.leader.userName} 正在讲，跟读中不能各改各的；等 TA 交棒后再操作`, 'error', 4200);
+  followPresentation({ force: true });
+  return false;
+}
+
 setInterval(() => {
   if (state.connected && state.ws && state.ws.readyState === WebSocket.OPEN) {
     send({ type: 'heartbeat' }, { quiet: true });
@@ -709,6 +763,34 @@ function handleMessage(msg) {
       break;
     case 'lock_denied':
       onLockDenied(msg);
+      break;
+    case 'presentation':
+      ingestPresentation(msg);
+      break;
+    case 'presentation_state':
+      if (msg.active === false) {
+        presentationByDoc.delete(msg.docId);
+        if (msg.docId === state.activeDocId) renderPresentBanner();
+      }
+      break;
+    case 'presentation_denied':
+      if (msg.leader) {
+        presentationByDoc.set(msg.docId, {
+          leader: msg.leader,
+          nodeId: msg.nodeId,
+          offer: null,
+        });
+        if (msg.docId === state.activeDocId) {
+          renderPresentBanner();
+          followPresentation({ force: true });
+        }
+      }
+      const stopsEdit = msg.write && (
+        edit.sourceId === msg.nodeId ||
+        (msg.docId === state.activeDocId && edit.docId === msg.docId)
+      );
+      if (stopsEdit) stopEditing('');
+      toast(msg.message || '这一轮不在你手里', 'error', 3600);
       break;
     case 'content':
       applyContent(msg);
@@ -988,6 +1070,11 @@ function ingestSnapshot(msg) {
     state.docs.get(docId).treeRev = msg.treeRev;
   }
   state.usersByDoc.set(docId, new Map((msg.users || []).map((u) => [u.userId, u])));
+  presentationByDoc.set(docId, msg.presentation ? {
+    leader: msg.presentation.leader,
+    nodeId: msg.presentation.nodeId,
+    offer: msg.presentation.offer || null,
+  } : null);
   if (msg.published) {
     publishedByDoc.set(docId, {
       pubSeq: msg.published.pubSeq,
@@ -1046,6 +1133,8 @@ function ingestSnapshot(msg) {
   }
 
   applyPendingFocus();
+  renderPresentBanner();
+  followPresentation({ force: true, flash: false });
 }
 
 function applyPendingFocus() {
@@ -1169,7 +1258,12 @@ function applyMove(msg) {
   node.pos = msg.pos;
   view.treeRev = msg.treeRev;
   reindex(view);
-  if (msg.docId === state.activeDocId) renderOutline();
+  if (msg.docId === state.activeDocId) {
+    renderOutline();
+    if (currentPresentation(msg.docId)?.nodeId === msg.nodeId) {
+      followPresentation({ flash: false });
+    }
+  }
 }
 
 function applyDeleted(msg) {
@@ -1290,9 +1384,12 @@ function renderActiveDoc() {
   renderOutline();
   renderTimeBanner();
   renderSyncState();
-  $('#add-root').disabled = !state.activeDocId || timeTravel.active;
+  renderPresentBanner();
+  $('#add-root').disabled = !state.activeDocId || timeTravel.active ||
+    (!!currentPresentation() && !amPresentationLeader());
   updateEditingHint();
   renderPublishChip();
+  requestAnimationFrame(() => followPresentation({ force: true, flash: false }));
 }
 
 /* ================= 对外定稿 ================= */
@@ -1334,6 +1431,7 @@ $('#publish-btn').addEventListener('click', () => {
     toast('请先保存或取消当前编辑再定稿', 'error');
     return;
   }
+  if (!requirePresenterForEdit()) return;
   const pub = currentPublished(docId);
   const view = viewOf(docId);
   const help = $('#publish-help');
@@ -1367,6 +1465,152 @@ $('#publish-form').addEventListener('submit', (e) => {
   send({ type: 'publish', docId, basePubSeq });
 });
 
+/* ================= 讲解/跟读 ================= */
+
+function ingestPresentation(msg) {
+  if (!msg.docId) return;
+  const previous = presentationByDoc.get(msg.docId) || null;
+  const next = msg.active ? {
+    leader: msg.leader,
+    nodeId: msg.nodeId,
+    offer: msg.offer || null,
+  } : null;
+  presentationByDoc.set(msg.docId, next);
+  if (msg.docId === state.activeDocId) {
+    if (next && timeTravel.active && !amPresentationLeader(next)) exitTimeTravel();
+    renderPresentBanner();
+    const becameFollower = previous?.leader.userId === state.me?.userId &&
+      next?.leader.userId !== state.me?.userId;
+    followPresentation({ force: becameFollower });
+  }
+}
+
+function renderPresentBanner() {
+  const banner = $('#present-banner');
+  const p = currentPresentation();
+  if (!banner) return;
+  if (!p || timeTravel.active) {
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+  const iAmLeader = amPresentationLeader(p);
+  const iAmTarget = state.me && p.offer?.userId === state.me.userId;
+  const info = $('#present-info');
+  const verb = iAmLeader ? '你正在讲，所有人跟着这一段' : `正在跟着 <strong>${escapeHtml(p.leader.userName)}</strong> 看同一段`;
+  let offerHtml = '';
+  if (p.offer) {
+    offerHtml = iAmLeader
+      ? ` · 已递给 <strong>${escapeHtml(p.offer.userName)}</strong>，对方接受前大家仍停在这里`
+      : iAmTarget
+        ? ' · 轮到你接棒'
+        : ` · ${escapeHtml(p.leader.userName)} 正在把这一轮交给 ${escapeHtml(p.offer.userName)}`;
+  }
+  info.innerHTML = `📣 ${verb}${offerHtml}`;
+
+  const actions = $('#present-actions');
+  actions.innerHTML = '';
+  const addBtn = (label, fn, primary = false) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    if (primary) b.className = 'primary';
+    b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+    actions.appendChild(b);
+    return b;
+  };
+
+  if (iAmLeader) {
+    const otherUsers = [...(state.usersByDoc.get(state.activeDocId)?.values() || [])]
+      .filter((u) => u.userId !== state.me.userId);
+    if (p.offer) {
+      addBtn('继续我讲（取消交棒）', cancelPresentationHandoff, true);
+    } else if (otherUsers.length) {
+      for (const u of otherUsers) addBtn(`交给 ${u.userName}`, () => handoffPresentation(u.userId));
+    }
+    addBtn('结束讲解', stopPresentation);
+  } else if (iAmTarget) {
+    addBtn('接过来讲', acceptPresentation, true);
+    addBtn('先不接', cancelPresentationHandoff);
+  } else {
+    const b = addBtn('跟读中', () => followPresentation({ force: true }));
+    b.disabled = true;
+  }
+}
+
+function startPresentation(nodeId) {
+  if (!requireOnline()) return;
+  if (timeTravel.active) {
+    toast('先回到现在，再开始讲解', 'error');
+    return;
+  }
+  const p = currentPresentation();
+  if (p && !amPresentationLeader(p)) {
+    toast(`${p.leader.userName} 正在讲这一轮；等 TA 交给你后才能换段`, 'error');
+    followPresentation({ force: true });
+    return;
+  }
+  const found = findRow(nodeId);
+  if (!found) return;
+  const docId = [...state.views.entries()].find(([, v]) => v.nodes.has(nodeId))?.[0];
+  if (!docId) return;
+  send({ type: 'presentation_start', docId, nodeId });
+}
+
+function pointPresentation(nodeId) {
+  const p = currentPresentation();
+  if (!p || !amPresentationLeader(p)) return;
+  send({ type: 'presentation_point', docId: state.activeDocId, nodeId });
+}
+
+function handoffPresentation(targetUserId) {
+  const p = currentPresentation();
+  if (!p || !amPresentationLeader(p) || !targetUserId) return;
+  if (!requireOnline()) return;
+  send({ type: 'presentation_handoff', docId: state.activeDocId, targetUserId });
+}
+
+function cancelPresentationHandoff() {
+  const p = currentPresentation();
+  if (!p || !p.offer) return;
+  if (!requireOnline()) return;
+  send({ type: 'presentation_cancel_handoff', docId: state.activeDocId });
+}
+
+function acceptPresentation() {
+  const p = currentPresentation();
+  if (!p || p.offer?.userId !== state.me?.userId) return;
+  if (!requireOnline()) return;
+  send({ type: 'presentation_accept', docId: state.activeDocId });
+}
+
+function stopPresentation() {
+  const p = currentPresentation();
+  if (!p || !amPresentationLeader(p)) return;
+  if (!requireOnline()) return;
+  send({ type: 'presentation_stop', docId: state.activeDocId });
+}
+
+// 只有当前讲解者可自行滚动；其他人一旦滚动/翻页，就被拉回服务器指定的同一段。
+function followPresentation({ force = false, flash = true } = {}) {
+  const docId = state.activeDocId;
+  const p = currentPresentation(docId);
+  const following = !!p && !amPresentationLeader(p) && !timeTravel.active &&
+    !!viewOf(docId) && !!state.me;
+  document.body.classList.toggle('presentation-following', following);
+  if (!following) return;
+  const view = viewOf(docId);
+  if (!view.nodes.has(p.nodeId)) return;
+  clearTimeout(presentFollowLock.timer);
+  presentFollowLock.timer = setTimeout(() => {
+    document.body.classList.remove('presentation-following');
+  }, 900);
+  requestAnimationFrame(() => {
+    scrollToRow(p.nodeId);
+    if (flash || force) flashRow(docId, p.nodeId, 1800);
+  });
+}
+
 function renderOutline() {
   const root = $('#outline');
   root.innerHTML = '';
@@ -1378,6 +1622,24 @@ function renderOutline() {
   if (!view) return;
   const roots = view.children.get(null) || [];
   for (const id of roots) root.appendChild(renderNode(view, id));
+}
+
+function isPresentationTarget(nodeId) {
+  const p = currentPresentation();
+  return !!p && !timeTravel.active && p.nodeId === nodeId;
+}
+
+function presentActionLabel(nodeId) {
+  const p = currentPresentation();
+  if (!p) return '讲解';
+  if (amPresentationLeader(p)) return p.nodeId === nodeId ? '正在指这段' : '指这里';
+  return '去讲解';
+}
+
+function presentNode(nodeId) {
+  const p = currentPresentation();
+  if (p && amPresentationLeader(p)) pointPresentation(nodeId);
+  else startPresentation(nodeId);
 }
 
 function renderNode(view, id) {
@@ -1408,6 +1670,7 @@ function renderNodeRow(view, node) {
   const el = document.createElement('div');
   el.className = 'node' + (node.kind === 'mirror' ? ' mirror-node' : '');
   el.dataset.nodeId = node.id;
+  if (isPresentationTarget(node.id)) el.classList.add('presentation-target');
   if (isEditingHere || lockedByMe) el.classList.add('locked-by-me');
   if (lockedByOther) el.classList.add('locked-by-other');
   if (node.kind === 'mirror' && node.sourceDeleted) el.classList.add('source-gone');
@@ -1441,6 +1704,7 @@ function renderNodeRow(view, node) {
         actionBtn('编辑', () => beginEdit(node.id)),
         actionBtn('提改写', () => openSuggestionComposer(node.id)),
         actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
+        actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       );
     } else {
       actions.append(actionBtn('↗ 打开源大纲', () => jumpToSource(node, {})));
@@ -1453,6 +1717,7 @@ function renderNodeRow(view, node) {
     actions.append(
       actionBtn('编辑', () => beginEdit(node.id)),
       actionBtn('提改写', () => openSuggestionComposer(node.id)),
+      actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       actionBtn('＋子级', () => addNode(node.id, null)),
       actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
       actionBtn('挂跟读', () => openMirrorPicker(node)),
@@ -1504,6 +1769,12 @@ function renderNodeRow(view, node) {
     const badge = document.createElement('span');
     badge.className = 'lock-badge';
     badge.textContent = '你正在编辑';
+    meta.appendChild(badge);
+  }
+  if (isPresentationTarget(node.id)) {
+    const badge = document.createElement('span');
+    badge.className = 'present-badge';
+    badge.textContent = amPresentationLeader() ? '📣 你正指着这里，大家跟随' : `📣 ${currentPresentation()?.leader.userName || '讲解者'} 正指着这里`;
     meta.appendChild(badge);
   }
   // 离线改动状态：待同步（黄）/ 与线上冲突待裁决（红，明示当前以线上为准）
@@ -1634,6 +1905,7 @@ function beginEdit(nodeId) {
     toast('回看模式里不能直接编辑；请用段落上的「从此刻继续编辑」另开一条线', 'error');
     return;
   }
+  if (!requirePresenterForEdit()) return;
   if (edit.sourceId) {
     toast('请先保存或取消当前编辑', 'error');
     return;
@@ -1948,6 +2220,7 @@ function updateEditingHint() {
 function requestMove(nodeId, parentId, afterId) {
   if (parentId === nodeId) return;
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
   send({
@@ -2010,6 +2283,7 @@ function indent(nodeId, delta) {
 
 function addNode(parentId, afterId) {
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   let docId = state.activeDocId;
   if (parentId) {
     const found = findRow(parentId);
@@ -2035,6 +2309,7 @@ $('#add-root').addEventListener('click', () => addNode(null, null));
 
 function deleteNode(nodeId) {
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
   if (found.node.kind === 'mirror') {
@@ -2062,6 +2337,7 @@ function countMirrors(sourceId) {
 
 function removeMirror(nodeId) {
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
   if (!confirm('移除这处跟读？（源段落和其它大纲里的跟读不受影响）')) return;
@@ -2130,6 +2406,7 @@ const suggestionComposer = { sourceId: null, baseVersion: 0, requestId: 0 };
 
 function openSuggestionComposer(nodeId) {
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   const found = findRow(nodeId);
   if (!found) return;
   const sourceId = sourceIdOf(found.node);
@@ -2178,6 +2455,7 @@ function withdrawSuggestion(proposal) {
 
 function acceptSuggestion(proposal) {
   if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
   if (!confirm('收下这版改写？收下后正文和所有跟读会立即统一为这一版。')) return;
   send({ type: 'suggestion_accept', suggestionId: proposal.id });
 }
@@ -2236,6 +2514,7 @@ function restoreRevision(nodeId, rev) {
     toast('请先结束当前段落的编辑', 'error');
     return;
   }
+  if (!requirePresenterForEdit()) return;
   const lockHolder = [...state.views.values()]
     .map((v) => v.lockInfo?.get(nodeId))
     .find(Boolean);
@@ -2270,6 +2549,12 @@ function restoreRevision(nodeId, rev) {
 /* ================= 整份时间轴：按时刻回看 + 从该时刻另开一条线 ================= */
 
 $('#timeline-btn').addEventListener('click', () => {
+  const p = currentPresentation();
+  if (p && !amPresentationLeader(p)) {
+    toast(`${p.leader.userName} 正在讲，先跟着这一轮；需要回看请等 TA 交棒或结束`, 'error', 4200);
+    followPresentation({ force: true });
+    return;
+  }
   $('#timeline-panel').classList.remove('hidden');
   send({ type: 'timeline' });
 });
@@ -2318,6 +2603,12 @@ function drawTimeline() {
 function enterTimeTravel(seq) {
   if (edit.sourceId) {
     toast('请先保存或取消当前编辑，再进入整份回看', 'error');
+    return;
+  }
+  const p = currentPresentation();
+  if (p && !amPresentationLeader(p)) {
+    toast(`${p.leader.userName} 正在讲，跟读中不能各看各的时刻`, 'error');
+    followPresentation({ force: true });
     return;
   }
   timeTravel.active = true;

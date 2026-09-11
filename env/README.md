@@ -11,6 +11,7 @@
 | 按整份来回看时间 | 结构与内容共用一张 append-only `timeline`（全局单调 seq 即"时刻"）：任意时刻可重建**整棵树的层级+正文**；跟读行投影源在**同一时刻**的内容，源这份和跟读这份严格对照，所有人看到同一份 |
 | 从旧时刻接着改 | 不是覆盖，而是**另开一条线**：该时刻的正文载入草稿，保存时以旧版本为共同祖先做三方合并（diff4）——现在这条线上别人后来写下、没撞上的改动自动保留；两人从同一时刻接着改，仍走合并/冲突裁决收敛成同一份 |
 | 对外定稿 | 工作稿（编辑们实时协同这份）与**对外定稿**（不可变快照）严格分开：外面的人打开 `/published/` 只读页，只看最近一次「定稿」冻结下来的整树内容，工作稿怎么改都不外泄；再点一次定稿，发布在**单个事务**里原子切换并向所有观看者推送同一份新快照；并发定稿靠 `basePubSeq` 乐观锁——两人同时定，只有一个成功，另一个收到 `publish_stale` 重确认，不存在"两边都定出去了却对不上"；没点确认绝不产生新版本，反悔零成本，外面始终停在上一版 |
+| 一人讲解、全员同段 | 每份大纲的讲解轮次是服务器内存里的**单一事实源**：同一时刻最多一个讲解者，所有跟读端按同一条 `presentation` 消息锁定并滚动到所指标题；并发开讲只有一人成功，另一人收到 `presentation_denied`。交棒是两阶段 offer：接受前讲解者和位置都不变，讲解者可随时取消，大家仍停在上一轮指着的地方；接受后原子切换 leader，全员再跟新人走同一段 |
 | Docker 部署 | 单镜像 + 一个命名卷，`docker compose up -d` |
 
 > 锁只是**协作提示**，不参与正确性。即使绕过锁（或锁刚好过期时两人同时提交），
@@ -55,8 +56,9 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（16 + 6 + 11 + 7 + 8 个场景）+ 离线续改端到端 + 单元测试
+npm test                  # WebSocket 端到端（16 + 6 + 11 + 7 + 9 + 10 个场景）+ 离线续改端到端 + 单元测试
 node test/offline.e2e.test.js             # 离线续改：真实客户端 + 服务器停启 + 重连对齐全流程
+node test/presentation.e2e.test.js        # 讲解轮次：唯一讲解者/抢轮/两阶段交棒/取消反悔/断线结束
 node test/published.e2e.test.js           # 对外定稿：隔离/冻结/原子切换/并发 CAS/只读边界/跟读冻结
 node test/client.smoke.test.js            # jsdom 客户端冒烟：多文档 + 跟读全流程
 node test/client.timetravel.smoke.test.js # jsdom 客户端冒烟：整份时间轴回看全流程
@@ -103,6 +105,12 @@ clientTag 回执对号、未保存草稿落盘）。
   「当前以线上（谁的 v几）为准」**，点徽章或顶栏胶囊打开裁决窗选最终内容。
   没保存的草稿也随输入落盘，下次打开同一段会提示恢复。
   离线时增/删/移动/挂跟读这类**结构改动不能暂存**（树版本锁无法离线对齐），会明确提示联网后再试。
+- **一人讲解，其他人跟读**：段落操作里点「讲解」开始这一轮，讲解者再点别段的「指这里」，所有正在看这份大纲的人都会被拉到同一段并停住，不能各翻各的。
+  - 顶栏显示当前讲解者；讲解者可以点「交给某人」发起交棒。
+  - **对方接受前，轮次还在讲解者手里、位置也不变**；讲解者点「继续我讲（取消交棒）」即可反悔，大家仍停在上一轮指着的段落。
+  - 对方点「接过来讲」后，服务器原子切换讲解者，所有人继续跟着新讲解者；旧讲解者不能再移动位置。
+  - 两个人几乎同时抢一轮，服务器只确认一个讲解者，另一个人收到提示并看到当前轮次，不会两边都显示自己在讲。
+  - 讲解是临时协作状态，服务重启或讲解者最后一个连接断开后本轮结束；正文和历史不受影响。
 - **对外定稿**：顶栏「📢 定稿」把**当前工作稿**冻结成对外版本（确认弹窗里可勾选"定稿后打开对外页"）。
   - 外面的人打开 `http://<站点>/published/?doc=<文档id>`（默认文档可省略参数），是**纯只读页**：
     没有登录、没有任何编辑入口；服务器把这种连接标记为 `viewer`，只推送定稿快照，
@@ -122,6 +130,7 @@ clientTag 回执对号、未保存草稿落盘）。
    │  HTTP 静态资源            WebSocket /ws（JSON 消息）
    ▼                                ▼
 Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence）
+   │                         └─ presentations（内存：文档级唯一讲解者/所指标题/交棒 offer）
    │
    ├── merge.js    token 级 diff3（拉丁按词、CJK 按字）
    ├── fraction.js 分数索引 midpoint（同层排序，无限插入不返工）
@@ -157,6 +166,20 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
   不依赖请求时机，天然"大家看到的一样"。跟读行投影源节点在同一 seq 的内容，
   源这份和跟读这份用同一个 seq 即可严格对照。
 
+### 讲解轮次协议要点
+
+- 状态只保存在服务器内存：`presentations: docId -> { leader, nodeId, offer }`，
+  快照给晚加入者，增量用 `presentation` 广播。
+- `presentation_start` 只在当前无讲解者时成功；Node.js 单线程顺序处理两条 WS 消息，
+  并发开讲天然串行化，后到者只会收到 `presentation_denied` 和当前状态。
+- 讲解者用 `presentation_point` 换段；非讲解者的换段请求被拒绝。
+- `presentation_handoff` 只写入待决 `offer`，**不替换 leader、不替换 nodeId**。
+  目标用 `presentation_accept` 后才在同一次请求里原子改 leader；在此之前讲解者或目标
+  都可以 `presentation_cancel_handoff`，取消后所有人看到的仍是上一轮的讲解者和位置。
+- 讲解者最后一个连接断开，或所指段落被删除，服务器清掉本轮并广播 `active:false`。
+- 前端在跟读状态下拦截 wheel/keyboard/touch/scroll 造成的翻页，并立即把视口拉回
+  服务器指定的 nodeId，避免 UI 上短暂"各翻各的"。
+
 ### 占用状态生命周期
 
 关键语义：**没操作只会让出"占用"，不会断开连接、不会关闭编辑器、不会丢草稿。**
@@ -182,6 +205,12 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 hello {userId, userName}
 hello {userId, userName, role:'viewer', docId}  # 对外定稿页：只读观看者，只进 view 房间
 lock {nodeId}            unlock {nodeId}
+presentation_start {docId, nodeId}
+presentation_point {docId, nodeId}      # 只有当前讲解者可移动所指标题
+presentation_handoff {docId,targetUserId}
+presentation_cancel_handoff {docId}
+presentation_accept {docId}
+presentation_stop {docId}
 heartbeat {nodeId?}
 save {nodeId, content, baseVersion, clientTag?}
 restore_save {nodeId, content, restoreVersion, clientTag?}   # 从旧版本/旧时刻接着改（diff4 另开一条线）
@@ -204,7 +233,9 @@ delete {nodeId, treeRev}
 
 ```
 hello {user}
-snapshot {title, treeRev, nodes[], locks[], users[], published?}
+snapshot {docId, title, treeRev, nodes[], locks[], presentation|null, users[], published?}
+presentation {docId, active, leader, nodeId, offer|null}   # 讲解轮次变化（active=false=本轮结束）
+presentation_denied {docId, leader, nodeId, message}
 published_state {docId, pubSeq, title, nodes|null, by?, createdAt?}  # 观看者初始；nodes=null=从未定稿
 published_changed {docId, pubSeq, timelineSeq, title, nodes[], by, createdAt}  # 定稿原子切换：编辑者+观看者都收
 published_ack {docId, pubSeq, unchanged?}    # 定稿成功回执（只回发布者本人；其他人收 published_changed）

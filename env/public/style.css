@@ -23,6 +23,7 @@ body {
   line-height: 1.6;
 }
 .hidden { display: none !important; }
+body.presentation-following { overscroll-behavior: none; }
 .muted { color: var(--muted); font-size: 13px; }
 button {
   font: inherit;
@@ -92,6 +93,31 @@ button.danger { color: var(--danger); border-color: #f3c0c0; }
   font-size: 13px; color: var(--warn);
   background: #fff7e8; border: 1px solid #f3dfb3;
   padding: 3px 10px; border-radius: 999px;
+}
+
+/* 讲解/跟读 */
+.present-banner {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; padding: 8px 22px;
+  background: #eef6ff; border-bottom: 1px solid #c9def8;
+  color: #1e3a5f; font-size: 13px;
+  position: sticky; top: 51px; z-index: 18;
+}
+.present-info { min-width: 0; }
+.present-info strong { color: #174ea6; }
+.present-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.present-banner button { padding: 4px 10px; font-size: 13px; }
+.present-banner button.primary { background: #174ea6; border-color: #174ea6; }
+.present-banner button.primary:hover { background: #123f86; }
+.node.presentation-target {
+  border-color: #174ea6;
+  box-shadow: 0 0 0 3px rgba(23, 78, 166, .22);
+}
+.present-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: #174ea6; background: #eef6ff;
+  border: 1px solid #c9def8; border-radius: 999px;
+  padding: 1px 10px; font-size: 11px;
 }
 
 /* 离线同步状态：顶栏胶囊 + 段落徽章 */

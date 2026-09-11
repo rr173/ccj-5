@@ -58,6 +58,11 @@ server.on('upgrade', (req, socket, head) => {
 // connId -> { ws, user: {userId, userName, color}, rooms: Set<docId> }
 const peers = new Map();
 
+// 讲解轮次是文档级的临时协作状态（不入库）：
+// 同一时刻每份大纲最多一个讲解者；服务器是唯一事实源，客户端不做乐观抢占。
+// nodeId 可以是普通段落，也可以是本文档里的跟读行。
+const presentations = new Map();
+
 function send(peer, msg) {
   if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(JSON.stringify(msg));
 }
@@ -68,6 +73,71 @@ function sendToDoc(docId, msg, exceptConnId = null) {
     if (connId === exceptConnId) continue;
     if (!peer.rooms || !peer.rooms.has(docId)) continue;
     if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data);
+  }
+}
+
+function publicUser(user) {
+  return { userId: user.userId, userName: user.userName, color: user.color };
+}
+
+function getPresentation(docId) {
+  return presentations.get(docId) || null;
+}
+
+function presentationMessage(docId) {
+  const p = getPresentation(docId);
+  if (!p) return { type: 'presentation', docId, active: false };
+  return {
+    type: 'presentation',
+    docId,
+    active: true,
+    leader: publicUser(p.leader),
+    nodeId: p.nodeId,
+    offer: p.offer ? { userId: p.offer.userId, userName: p.offer.userName } : null,
+  };
+}
+
+function broadcastPresentation(docId, exceptConnId = null) {
+  sendToDoc(docId, presentationMessage(docId), exceptConnId);
+}
+
+function presentationNodeExists(docId, nodeId) {
+  const row = store.getNode(db, nodeId);
+  return !!row && row.doc_id === docId && !row.deleted;
+}
+
+function denyWriteWhileFollowing(peer, docId, extra = {}) {
+  const current = getPresentation(docId);
+  if (!current || current.leader.userId === peer.user.userId) return true;
+  send(peer, {
+    type: 'presentation_denied',
+    docId,
+    leader: publicUser(current.leader),
+    nodeId: current.nodeId,
+    write: true,
+    ...extra,
+    message: extra.message ||
+      `${current.leader.userName} 正在讲这一轮，跟读时不能修改；等 TA 交棒后再操作`,
+  });
+  return false;
+}
+
+// 源段落可能同时以跟读身份出现在多份大纲。只要其中一处正在讲解，
+// 就不能从源行或另一个挂载点把内容改掉，避免讲着的段落变化。
+function denySourceWriteWhileFollowing(peer, sourceId) {
+  for (const docId of audienceDocIds(sourceId)) {
+    if (!denyWriteWhileFollowing(peer, docId, { nodeId: sourceId })) return false;
+  }
+  return true;
+}
+
+// 讲解中的源段落被删除时，普通行已不在文档里；跟读行仍会保留成墓碑。
+// 本轮不再指段，等待讲解者重新开始或交给下一位。
+function clearPresentationIfPointing(docId, nodeIds, exceptConnId = null) {
+  const p = getPresentation(docId);
+  if (p && nodeIds.includes(p.nodeId)) {
+    presentations.delete(docId);
+    broadcastPresentation(docId, exceptConnId);
   }
 }
 
@@ -137,6 +207,7 @@ function resolveEditable(nodeId) {
 function snapshotMessage(docId) {
   const snap = store.getSnapshot(db, docId);
   const pub = store.getCurrentPublication(db, docId);
+  const presentation = getPresentation(docId);
   return {
     type: 'snapshot',
     docId: snap.doc.id,
@@ -144,6 +215,15 @@ function snapshotMessage(docId) {
     treeRev: snap.doc.tree_rev,
     nodes: snap.nodes,
     locks: relevantLocks(docId, snap.nodes),
+    presentation: presentation
+      ? {
+          leader: publicUser(presentation.leader),
+          nodeId: presentation.nodeId,
+          offer: presentation.offer
+            ? { userId: presentation.offer.userId, userName: presentation.offer.userName }
+            : null,
+        }
+      : null,
     suggestions: relevantSuggestions(snap.nodes),
     users: presenceList(docId),
     published: pub
@@ -285,6 +365,7 @@ function handlePublish(peer, msg) {
     send(peer, { type: 'error', message: '大纲不存在' });
     return;
   }
+  if (!denyWriteWhileFollowing(peer, docId)) return;
   const basePubSeq = Number(msg.basePubSeq);
   if (!Number.isInteger(basePubSeq) || basePubSeq < 0) {
     send(peer, { type: 'error', docId, message: '缺少定稿基准序号' });
@@ -425,6 +506,188 @@ function handleHeartbeat(peer, msg) {
   }
 }
 
+// ---------- 讲解/跟读：文档级唯一讲解者，服务器原子裁决 ----------
+//
+// 关键语义：
+// - 同一文档的 state 只有一个 leader；两个 start 顺序进入同一个 JS 事件循环，
+//   后到者只收到 denied，不会出现两个本机都自认讲解者。
+// - point 只改服务器状态后全员广播，所有观看端按同一条消息滚到同一段。
+// - handoff 只是"递给某人"的待决 offer；leader 与 nodeId 不立刻变化。
+//   对方 accept 后才在同一次处理里原子切换；leader 或目标在 accept 前取消，
+//   大家仍停在上一轮 leader 指着的 nodeId。
+
+function presentationUserInDoc(docId, userId) {
+  for (const p of peers.values()) {
+    if (p.user && p.rooms?.has(docId) && p.user.userId === userId) return publicUser(p.user);
+  }
+  return null;
+}
+
+function handlePresentationStart(peer, msg) {
+  const docId = String(msg.docId || '');
+  const nodeId = String(msg.nodeId || '');
+  if (!store.getDoc(db, docId)) {
+    send(peer, { type: 'error', docId, message: '大纲不存在' });
+    return;
+  }
+  if (!presentationNodeExists(docId, nodeId)) {
+    send(peer, { type: 'error', docId, message: '讲解段落不存在' });
+    return;
+  }
+  const current = getPresentation(docId);
+  if (current && current.leader.userId !== peer.user.userId) {
+    send(peer, {
+      type: 'presentation_denied',
+      docId,
+      leader: publicUser(current.leader),
+      nodeId: current.nodeId,
+      message: `${current.leader.userName} 正在讲这一轮`,
+    });
+    return;
+  }
+  presentations.set(docId, {
+    leader: { ...publicUser(peer.user), connId: peer.connId },
+    nodeId,
+    offer: null,
+  });
+  broadcastPresentation(docId);
+}
+
+function requirePresentationLeader(peer, docId) {
+  const current = getPresentation(docId);
+  if (!current) {
+    send(peer, { type: 'presentation_state', docId, active: false });
+    return null;
+  }
+  if (current.leader.userId !== peer.user.userId) {
+    send(peer, {
+      type: 'presentation_denied',
+      docId,
+      leader: publicUser(current.leader),
+      nodeId: current.nodeId,
+      message: `只有当前讲解者 ${current.leader.userName} 可以操作这一轮`,
+    });
+    return null;
+  }
+  return current;
+}
+
+function handlePresentationPoint(peer, msg) {
+  const docId = String(msg.docId || '');
+  const nodeId = String(msg.nodeId || '');
+  const current = requirePresentationLeader(peer, docId);
+  if (!current) return;
+  if (!presentationNodeExists(docId, nodeId)) {
+    send(peer, { type: 'error', docId, message: '讲解段落不存在' });
+    return;
+  }
+  current.nodeId = nodeId;
+  current.offer = null; // 讲解者继续指向新段，之前未接受的交棒作废
+  broadcastPresentation(docId);
+}
+
+function handlePresentationStop(peer, msg) {
+  const docId = String(msg.docId || '');
+  const current = getPresentation(docId);
+  if (!current) return;
+  if (current.leader.userId !== peer.user.userId) {
+    send(peer, {
+      type: 'presentation_denied',
+      docId,
+      leader: publicUser(current.leader),
+      nodeId: current.nodeId,
+      message: `只有 ${current.leader.userName} 可以结束这一轮`,
+    });
+    return;
+  }
+  presentations.delete(docId);
+  broadcastPresentation(docId);
+}
+
+function handlePresentationHandoff(peer, msg) {
+  const docId = String(msg.docId || '');
+  const targetUserId = String(msg.targetUserId || '');
+  const current = requirePresentationLeader(peer, docId);
+  if (!current) return;
+  if (targetUserId === peer.user.userId) {
+    send(peer, { type: 'error', docId, message: '这一轮已经在你手里' });
+    return;
+  }
+  const target = presentationUserInDoc(docId, targetUserId);
+  if (!target) {
+    send(peer, { type: 'error', docId, message: '对方当前不在这份大纲里' });
+    return;
+  }
+  current.offer = { userId: target.userId, userName: target.userName };
+  broadcastPresentation(docId);
+}
+
+function handlePresentationCancelHandoff(peer, msg) {
+  const docId = String(msg.docId || '');
+  const current = getPresentation(docId);
+  if (!current?.offer) return;
+  const isLeader = current.leader.userId === peer.user.userId;
+  const isTarget = current.offer.userId === peer.user.userId;
+  if (!isLeader && !isTarget) return;
+  current.offer = null;
+  broadcastPresentation(docId);
+}
+
+function handlePresentationAccept(peer, msg) {
+  const docId = String(msg.docId || '');
+  const current = getPresentation(docId);
+  if (!current) return;
+  if (!current.offer || current.offer.userId !== peer.user.userId) {
+    send(peer, {
+      type: 'presentation_denied',
+      docId,
+      leader: publicUser(current.leader),
+      nodeId: current.nodeId,
+      message: '这一轮没有交到你这里',
+    });
+    return;
+  }
+  if (!presentationNodeExists(docId, current.nodeId)) {
+    presentations.delete(docId);
+    broadcastPresentation(docId);
+    send(peer, { type: 'error', docId, message: '刚才指着的段落已不存在，请重新开始一轮' });
+    return;
+  }
+  // 原子完成交棒：同一时刻只替换 leader，不产生两个 leader 的中间状态。
+  current.leader = { ...publicUser(peer.user), connId: peer.connId };
+  current.offer = null;
+  broadcastPresentation(docId);
+}
+
+function cleanupPresentationsOnDisconnect(closedPeer) {
+  for (const docId of [...closedPeer.rooms]) {
+    const current = getPresentation(docId);
+    if (!current) continue;
+    const sameUserStillOpen = [...peers.values()].some((p) =>
+      p !== closedPeer &&
+      p.user &&
+      p.rooms?.has(docId) &&
+      p.user.userId === current.leader.userId,
+    );
+    if (current.leader.userId === closedPeer.user.userId && !sameUserStillOpen) {
+      // 讲解者最后一个连接断开：这一轮无法继续操作，直接结束，避免出现幽灵讲解者。
+      presentations.delete(docId);
+      broadcastPresentation(docId);
+    } else if (current.offer?.userId === closedPeer.user.userId) {
+      const targetStillOpen = [...peers.values()].some((p) =>
+        p !== closedPeer &&
+        p.user &&
+        p.rooms?.has(docId) &&
+        p.user.userId === current.offer.userId,
+      );
+      if (!targetStillOpen) {
+        current.offer = null;
+        broadcastPresentation(docId);
+      }
+    }
+  }
+}
+
 // ---------- 改写提议：公开草稿，不占编辑锁、不改正文 ----------
 
 function handleSuggestionAdd(peer, msg) {
@@ -435,6 +698,7 @@ function handleSuggestionAdd(peer, msg) {
     return;
   }
   const source = resolved.source;
+  if (!denySourceWriteWhileFollowing(peer, source.id)) return;
   const content = String(msg.content ?? '').slice(0, 100_000);
   const baseVersion = Number(msg.baseVersion);
   if (!Number.isInteger(baseVersion) || baseVersion < 1) {
@@ -482,6 +746,8 @@ function handleSuggestionAdd(peer, msg) {
 
 function handleSuggestionWithdraw(peer, msg) {
   const suggestionId = String(msg.suggestionId || '');
+  const existing = store.getSuggestion(db, suggestionId);
+  if (existing && !denySourceWriteWhileFollowing(peer, existing.node_id)) return;
   const result = store.withdrawSuggestion(db, { suggestionId, userId: peer.user.userId });
   if (result.status === 'missing') {
     send(peer, { type: 'error', message: '改写不存在或已被处理' });
@@ -509,6 +775,9 @@ function handleSuggestionWithdraw(peer, msg) {
 
 function handleSuggestionAccept(peer, msg) {
   const suggestionId = String(msg.suggestionId || '');
+  const existing = store.getSuggestion(db, suggestionId);
+  if (existing && existing.status === 'pending' &&
+      !denySourceWriteWhileFollowing(peer, existing.node_id)) return;
   const result = store.acceptSuggestion(db, {
     suggestionId,
     userId: peer.user.userId,
@@ -620,6 +889,7 @@ function handleSave(peer, msg) {
     send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
+  if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
   const latest = store.getLatestRevision(db, nodeId);
 
   // 版本一致：直接落库
@@ -736,6 +1006,7 @@ function handleRestoreSave(peer, msg) {
     send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
+  if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
   const latest = store.getLatestRevision(db, nodeId);
   const baseRev = store.getRevisionByVersion(db, nodeId, restoreVersion);
   if (!baseRev) {
@@ -839,6 +1110,7 @@ function handleResolve(peer, msg) {
     send(peer, { type: 'error', nodeId, message: '该段落已被删除', clientTag });
     return;
   }
+  if (!denySourceWriteWhileFollowing(peer, nodeId)) return;
   const latest = store.getLatestRevision(db, nodeId);
   const result = store.saveContent(db, {
     nodeId,
@@ -885,6 +1157,7 @@ function handleAdd(peer, msg) {
     send(peer, { type: 'error', message: '大纲不存在' });
     return;
   }
+  if (!denyWriteWhileFollowing(peer, docId)) return;
   if (Number(msg.treeRev) !== doc.tree_rev) {
     sendStale(peer, doc);
     return;
@@ -927,6 +1200,7 @@ function handleAddMirror(peer, msg) {
     send(peer, { type: 'error', message: '目标大纲不存在' });
     return;
   }
+  if (!denyWriteWhileFollowing(peer, hostDocId)) return;
   if (Number(msg.treeRev) !== hostDoc.tree_rev) {
     sendStale(peer, hostDoc);
     return;
@@ -989,6 +1263,8 @@ function handleMove(peer, msg) {
   const node = store.getNode(db, nodeId);
   if (!node || node.deleted) return;
   const doc = store.getDoc(db, node.doc_id);
+  if (!doc) return;
+  if (!denyWriteWhileFollowing(peer, doc.id)) return;
   if (treeRev !== doc.tree_rev) {
     sendStale(peer, doc);
     return;
@@ -1053,6 +1329,8 @@ function handleDelete(peer, msg) {
   const row = store.getNode(db, nodeId);
   if (!row || row.deleted) return;
   const doc = store.getDoc(db, row.doc_id);
+  if (!doc) return;
+  if (!denyWriteWhileFollowing(peer, doc.id)) return;
   if (Number(msg.treeRev) !== doc.tree_rev) {
     sendStale(peer, doc);
     return;
@@ -1065,6 +1343,7 @@ function handleDelete(peer, msg) {
       userId: peer.user.userId, userName: peer.user.userName,
     });
     if (result.status !== 'deleted') return;
+    clearPresentationIfPointing(doc.id, result.ids);
     sendToDoc(doc.id, {
       type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
     });
@@ -1086,7 +1365,8 @@ function handleDelete(peer, msg) {
     }
   }
 
-  // 源文档：节点从树里消失
+  // 源文档：节点从树里消失（讲解轮次若正指着被删段落，也在此原子结束）
+  clearPresentationIfPointing(doc.id, result.ids);
   sendToDoc(doc.id, {
     type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
   });
@@ -1150,6 +1430,12 @@ wss.on('connection', (ws) => {
         case 'lock': handleLock(peer, msg); break;
         case 'unlock': handleUnlock(peer, msg); break;
         case 'heartbeat': handleHeartbeat(peer, msg); break;
+        case 'presentation_start': handlePresentationStart(peer, msg); break;
+        case 'presentation_point': handlePresentationPoint(peer, msg); break;
+        case 'presentation_stop': handlePresentationStop(peer, msg); break;
+        case 'presentation_handoff': handlePresentationHandoff(peer, msg); break;
+        case 'presentation_cancel_handoff': handlePresentationCancelHandoff(peer, msg); break;
+        case 'presentation_accept': handlePresentationAccept(peer, msg); break;
         case 'suggestion_add': handleSuggestionAdd(peer, msg); break;
         case 'suggestion_withdraw': handleSuggestionWithdraw(peer, msg); break;
         case 'suggestion_accept': handleSuggestionAccept(peer, msg); break;
@@ -1172,6 +1458,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     peers.delete(connId);
+    cleanupPresentationsOnDisconnect(peer);
     // 锁释放要扇出到源文档 + 跟读宿主文档（两边占用同时消失）
     const released = locks.releaseAll(connId);
     for (const nodeId of released) {
