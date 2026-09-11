@@ -6,8 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "npm run test:e2e && npm run test:mirror && npm run test:timetravel && npm run test:offline && npm run test:unit",
+    "test": "npm run test:e2e && npm run test:suggestions && npm run test:mirror && npm run test:timetravel && npm run test:offline && npm run test:unit",
     "test:e2e": "WS_PORT=3777 WS_PING_MS=300 DB_FILE=./data/test.db node test/e2e.test.js",
+    "test:suggestions": "WS_PORT=3780 DB_FILE=./data/suggestions.db node test/suggestions.e2e.test.js",
     "test:mirror": "WS_PORT=3778 WS_PING_MS=300 DB_FILE=./data/mirror.db node test/mirror.e2e.test.js",
     "test:timetravel": "WS_PORT=3779 WS_PING_MS=300 DB_FILE=./data/timetravel.db node test/timetravel.e2e.test.js",
     "test:offline": "node test/offline.e2e.test.js",

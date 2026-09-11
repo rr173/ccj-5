@@ -109,6 +109,23 @@
     </div>
   </div>
 
+  <!-- 提出改写弹窗 -->
+  <div id="suggestion-mask" class="conflict-mask hidden">
+    <form id="suggestion-form" class="newdoc-card suggestion-card">
+      <h3>提出一版改写</h3>
+      <p class="muted" id="suggestion-help">
+        这版会先公开给所有正在看这份大纲（含跟读处）的人，不会写入正文；有人收下后才统一更新。
+      </p>
+      <label class="final-label">改写内容
+        <textarea id="suggestion-content" rows="10" required></textarea>
+      </label>
+      <div class="conflict-actions">
+        <button type="button" id="suggestion-cancel" class="ghost">取消</button>
+        <button type="submit" class="primary">提出改写</button>
+      </div>
+    </form>
+  </div>
+
   <!-- 冲突解决弹窗 -->
   <div id="conflict-mask" class="conflict-mask hidden">
     <div class="conflict-card">

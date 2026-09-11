@@ -156,6 +156,41 @@ async function main() {
   const srcRow = $(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-content`).textContent;
   assert(srcRow.includes('【从跟读改】') && srcRow.includes('【冒烟源改动】'), '源段落就是同一份（两边收敛）');
 
+  // ---- 公开改写：先出卡片不改正文；在跟读处收下后，源与跟读统一 ----
+  const proposeBtn = [...$$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-actions button`)]
+    .find((b) => b.textContent === '提改写');
+  assert(!!proposeBtn, '源段落操作条有「提改写」');
+  proposeBtn.click();
+  await sleep(100);
+  assert(!$('#suggestion-mask').classList.contains('hidden'), '提出改写弹窗打开');
+  $('#suggestion-content').value = srcRow + '【冒烟提议收下】';
+  $('#suggestion-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await sleep(300);
+  assert($('#suggestion-mask').classList.contains('hidden'), '提交后关闭改写弹窗');
+  const proposalCard = $(`.node-outer[data-node-id="${sourceNodeId}"] .suggestion-card`);
+  assert(!!proposalCard && proposalCard.textContent.includes('【冒烟提议收下】'), '源行出现公开改写卡片');
+  assert(
+    !$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-content`).textContent.includes('【冒烟提议收下】'),
+    '收下前正文仍保持原样',
+  );
+
+  $$('.doc-tab-label')[1].click();
+  await sleep(250);
+  const mirrorProposal = $(`.node-outer[data-node-id="${mirrorId}"] .suggestion-card`);
+  assert(!!mirrorProposal, '跟读处也能看到同一版公开改写');
+  const acceptBtn = [...mirrorProposal.querySelectorAll('button')].find((b) => b.textContent === '收下这版');
+  acceptBtn.click();
+  await sleep(400);
+  const mirrorAccepted = $(`.node-outer[data-node-id="${mirrorId}"] > .node .node-content`).textContent;
+  assert(mirrorAccepted.includes('【冒烟提议收下】'), '跟读处收下后跟读正文更新');
+  assert(!$(`.node-outer[data-node-id="${mirrorId}"] .suggestion-card`), '收下后跟读处改写卡片消失');
+
+  $$('.doc-tab-label')[0].click();
+  await sleep(250);
+  const sourceAccepted = $(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-content`).textContent;
+  assert(sourceAccepted.includes('【冒烟提议收下】'), '收下后源正文也是同一版');
+  assert(!$(`.node-outer[data-node-id="${sourceNodeId}"] .suggestion-card`), '收下后源行改写卡片消失');
+
   // ---- 删除源段落 -> 跟读墓碑，不显示旧正文 ----
   const editBtn2 = [...$$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-actions button`)]
     .find((b) => b.textContent === '编辑');

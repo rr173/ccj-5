@@ -50,6 +50,23 @@ function init(dbFile) {
     );
     CREATE INDEX IF NOT EXISTS idx_rev_node ON revisions(node_id, version);
 
+    -- 公开的改写提议：pending 期间所有人可见，但绝不参与正文投影；
+    -- accepted 时在同一个事务里 CAS 到 revisions，原子地完成"收下"。
+    CREATE TABLE IF NOT EXISTS suggestions (
+      id              TEXT PRIMARY KEY,
+      node_id         TEXT NOT NULL,      -- 永远是源节点 id（跟读入口也解析到源）
+      base_version    INTEGER NOT NULL,   -- 提议所基于的正文版本
+      content         TEXT NOT NULL,
+      author_id       TEXT NOT NULL,
+      author          TEXT NOT NULL,
+      status          TEXT NOT NULL,      -- pending | accepted | withdrawn | superseded
+      accepted_rev_id INTEGER,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_suggestions_node
+      ON suggestions(node_id, status, created_at);
+
     -- 整份大纲的 append-only 时间轴：结构（增/移/删/挂跟读）与内容（每次保存）
     -- 共用同一个全局单调 seq，seq 就是"时刻"坐标。任意 seq 可确定性重建
     -- 当时整棵树的层级 + 正文（跟读投影源在同一 seq 的内容），所有人看到
@@ -337,6 +354,175 @@ function getHistory(db, nodeId, limit = 100) {
     .all(nodeId, limit);
 }
 
+// ---------- 改写提议 ----------
+
+function normalizeSuggestion(r) {
+  return {
+    id: r.id,
+    nodeId: r.node_id,
+    baseVersion: r.base_version,
+    content: r.content,
+    authorId: r.author_id,
+    author: r.author,
+    status: r.status,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function getSuggestion(db, suggestionId) {
+  const row = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(suggestionId);
+  return row ? normalizeSuggestion(row) : null;
+}
+
+function listPendingSuggestions(db, sourceIds) {
+  const ids = [...new Set(sourceIds || [])];
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  return db
+    .prepare(
+      `SELECT * FROM suggestions
+       WHERE status = 'pending' AND node_id IN (${placeholders})
+       ORDER BY created_at, rowid`,
+    )
+    .all(...ids)
+    .map(normalizeSuggestion);
+}
+
+function supersedePendingSuggestions(db, nodeId, exceptSuggestionId = null) {
+  const rows = db
+    .prepare(
+      `SELECT id FROM suggestions
+       WHERE node_id = ? AND status = 'pending'
+         AND (? IS NULL OR id != ?)`,
+    )
+    .all(nodeId, exceptSuggestionId, exceptSuggestionId);
+  const ids = rows.map((r) => r.id);
+  if (ids.length) {
+    const now = Date.now();
+    const placeholders = ids.map(() => '?').join(',');
+    db
+      .prepare(`UPDATE suggestions SET status = 'superseded', updated_at = ? WHERE id IN (${placeholders})`)
+      .run(now, ...ids);
+  }
+  return ids;
+}
+
+function createSuggestion(db, { id, nodeId, content, baseVersion, userId, userName }) {
+  return db.transaction(() => {
+    const node = getNode(db, nodeId);
+    if (!node || node.deleted || node.mirror_of) return { status: 'missing' };
+    const latest = getLatestRevision(db, nodeId);
+    if (!latest) return { status: 'missing' };
+    if (!Number.isInteger(baseVersion) || baseVersion < 1) return { status: 'bad_base' };
+    if (latest.version !== baseVersion) return { status: 'stale', latest: normalizeRevision(latest) };
+    if (latest.content === content) return { status: 'noop', latest: normalizeRevision(latest) };
+
+    const now = Date.now();
+    db
+      .prepare(
+        `INSERT INTO suggestions
+           (id, node_id, base_version, content, author_id, author, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(id, nodeId, baseVersion, content, userId, userName, now, now);
+    return { status: 'created', suggestion: getSuggestion(db, id) };
+  })();
+}
+
+function withdrawSuggestion(db, { suggestionId, userId }) {
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(suggestionId);
+    if (!row) return { status: 'missing' };
+    if (row.author_id !== userId) return { status: 'forbidden' };
+    if (row.status !== 'pending') return { status: 'not_pending', suggestion: normalizeSuggestion(row) };
+    const now = Date.now();
+    db.prepare("UPDATE suggestions SET status = 'withdrawn', updated_at = ? WHERE id = ?").run(now, suggestionId);
+    return { status: 'withdrawn', suggestion: getSuggestion(db, suggestionId) };
+  })();
+}
+
+// 收下提议：CAS 条件 = 提议仍是 pending，且正文当前版本仍是它所基于的版本。
+// 插入 revision 与把同段其它 pending 置为 superseded 在同一事务，杜绝两边都回执成功。
+function acceptSuggestion(db, { suggestionId, userId, userName }) {
+  return db.transaction(() => {
+    const srow = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(suggestionId);
+    if (!srow) return { status: 'missing' };
+    const suggestion = normalizeSuggestion(srow);
+    const node = getNode(db, suggestion.nodeId);
+    if (!node || node.deleted || node.mirror_of) return { status: 'missing', suggestion };
+    if (suggestion.status === 'accepted' || suggestion.status === 'withdrawn') {
+      return { status: 'not_pending', suggestion };
+    }
+
+    const latest = getLatestRevision(db, suggestion.nodeId);
+    if (!latest) return { status: 'missing', suggestion };
+    if (suggestion.status === 'superseded' || latest.version !== suggestion.baseVersion) {
+      const now = Date.now();
+      db.prepare("UPDATE suggestions SET status = 'superseded', updated_at = ? WHERE id = ? AND status = 'pending'").run(now, suggestionId);
+      return {
+        status: 'stale',
+        suggestion: getSuggestion(db, suggestionId),
+        latest: normalizeRevision(latest),
+        supersededIds: [suggestionId],
+      };
+    }
+    if (latest.content === suggestion.content) {
+      db
+        .prepare('UPDATE suggestions SET status = ?, accepted_rev_id = ?, updated_at = ? WHERE id = ?')
+        .run('accepted', latest.id, Date.now(), suggestionId);
+      return { status: 'noop', revision: normalizeRevision(latest), suggestion: getSuggestion(db, suggestionId) };
+    }
+
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `INSERT INTO revisions (node_id, doc_id, version, content, author_id, author, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        suggestion.nodeId,
+        node.doc_id,
+        latest.version + 1,
+        suggestion.content,
+        suggestion.authorId,
+        suggestion.author,
+        `改写提议被 ${userName} 收下`,
+        now,
+      );
+    const revision = getRevision(db, suggestion.nodeId, info.lastInsertRowid);
+    db
+      .prepare('UPDATE suggestions SET status = ?, accepted_rev_id = ?, updated_at = ? WHERE id = ?')
+      .run('accepted', revision.id, now, suggestionId);
+    const supersededIds = supersedePendingSuggestions(db, suggestion.nodeId, suggestionId);
+    logEvent(db, {
+      docId: node.doc_id,
+      kind: 'content',
+      nodeId: suggestion.nodeId,
+      revId: revision.id,
+      author: suggestion.author,
+      authorId: suggestion.authorId,
+      note: `改写提议被 ${userName} 收下`,
+      at: now,
+    });
+    return { status: 'saved', revision, suggestion: getSuggestion(db, suggestionId), supersededIds };
+  })();
+}
+
+function normalizeRevision(r) {
+  return {
+    id: r.id,
+    node_id: r.node_id,
+    doc_id: r.doc_id,
+    version: r.version,
+    content: r.content,
+    author_id: r.author_id,
+    author: r.author,
+    note: r.note,
+    created_at: r.created_at,
+  };
+}
+
 // ---------- 写入（均在事务内完成）----------
 
 // 追加一条 revision；expectedVersion 是编辑所基于的版本。
@@ -363,11 +549,12 @@ function saveContent(db, { nodeId, content, expectedVersion, userId, userName, n
       )
       .run(nodeId, node.doc_id, version, content, userId, userName, note || '', now);
     const revision = getRevision(db, nodeId, info.lastInsertRowid);
+    const supersededSuggestionIds = supersedePendingSuggestions(db, nodeId);
     logEvent(db, {
       docId: node.doc_id, kind: 'content', nodeId, revId: revision.id,
       author: userName, authorId: userId, note: note || '', at: now,
     });
-    return { status: 'saved', revision };
+    return { status: 'saved', revision, supersededSuggestionIds };
   })();
 }
 
@@ -469,6 +656,10 @@ function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
     }
     const stmt = db.prepare('UPDATE nodes SET deleted = 1 WHERE id = ?');
     for (const id of ids) stmt.run(id);
+    const supersededSuggestionIds = [];
+    for (const id of ids) {
+      supersededSuggestionIds.push(...supersedePendingSuggestions(db, id));
+    }
     logEvent(db, {
       docId: doc.id, kind: 'delete', nodeId, deletedIds: ids,
       author: userName, authorId: userId,
@@ -480,6 +671,7 @@ function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
       ids,
       treeRev: getDoc(db, doc.id).tree_rev,
       kind: node.mirror_of ? 'mirror' : 'node',
+      supersededSuggestions: supersededSuggestionIds.map((id) => getSuggestion(db, id)),
     };
   })();
 }
@@ -639,6 +831,11 @@ module.exports = {
   getRevision,
   getRevisionByVersion,
   getHistory,
+  getSuggestion,
+  listPendingSuggestions,
+  createSuggestion,
+  withdrawSuggestion,
+  acceptSuggestion,
   saveContent,
   addNode,
   addMirrorNode,

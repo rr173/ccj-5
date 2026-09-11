@@ -177,11 +177,12 @@ button.danger-text { color: var(--danger); }
   display: flex; flex-direction: column; gap: 12px;
 }
 .newdoc-card h3 { margin: 0; }
-.newdoc-card input, .newdoc-card select {
+.newdoc-card input, .newdoc-card select, .newdoc-card textarea {
   font: inherit; padding: 9px 11px;
   border: 1px solid var(--border); border-radius: 8px; width: 100%;
 }
-.newdoc-card input:focus, .newdoc-card select:focus {
+.newdoc-card textarea { resize: vertical; min-height: 180px; line-height: 1.6; }
+.newdoc-card input:focus, .newdoc-card select:focus, .newdoc-card textarea:focus {
   outline: 2px solid #b7cdf7; border-color: var(--accent);
 }
 
@@ -229,6 +230,39 @@ button.danger-text { color: var(--danger); }
   color: var(--muted);
 }
 .node-actions button:hover { color: var(--text); border-color: var(--border); }
+
+.suggestion-list {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 0 12px 8px;
+}
+.suggestion-card {
+  border: 1px solid #c7d7fe;
+  background: #f8fbff;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.suggestion-card.mine { border-color: #93b4fc; background: #f1f6ff; }
+.suggestion-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; font-size: 13px; margin-bottom: 4px;
+}
+.suggestion-text {
+  white-space: pre-wrap; word-break: break-word;
+  color: #263150; font-size: 14px;
+}
+.suggestion-tools {
+  display: flex; justify-content: flex-end; gap: 6px;
+  margin-top: 6px;
+}
+.suggestion-tools button {
+  padding: 2px 9px; font-size: 12px;
+}
+.suggestion-card textarea,
+.suggestion-card.suggestion-form-card textarea {
+  width: 100%; font: inherit; line-height: 1.6;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; resize: vertical; min-height: 180px;
+}
 
 .node-edit textarea {
   width: 100%; font: inherit; line-height: 1.6;

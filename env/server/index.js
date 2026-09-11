@@ -110,18 +110,29 @@ function snapshotMessage(docId) {
     treeRev: snap.doc.tree_rev,
     nodes: snap.nodes,
     locks: relevantLocks(docId, snap.nodes),
+    suggestions: relevantSuggestions(snap.nodes),
     users: presenceList(docId),
   };
 }
 
 // 快照里只带本文档看得见的锁：源段落在本文档，或本文档挂着它的跟读
 function relevantLocks(docId, nodes) {
+  const sourceIds = visibleSourceIds(nodes);
+  return locks.list().filter((l) => sourceIds.has(l.nodeId));
+}
+
+// 快照只带当前文档可见源段的待决改写（源行与跟读行共用同一份）
+function relevantSuggestions(nodes) {
+  return store.listPendingSuggestions(db, [...visibleSourceIds(nodes)]);
+}
+
+function visibleSourceIds(nodes) {
   const sourceIds = new Set();
   for (const n of nodes) {
     if (n.kind === 'mirror') sourceIds.add(n.mirrorOf);
     else sourceIds.add(n.id);
   }
-  return locks.list().filter((l) => sourceIds.has(l.nodeId));
+  return sourceIds;
 }
 
 function docListMessage() {
@@ -230,6 +241,171 @@ function handleHeartbeat(peer, msg) {
   }
 }
 
+// ---------- 改写提议：公开草稿，不占编辑锁、不改正文 ----------
+
+function handleSuggestionAdd(peer, msg) {
+  const entryId = String(msg.nodeId || '');
+  const resolved = resolveEditable(entryId);
+  if (resolved.error) {
+    send(peer, { type: 'error', nodeId: entryId, message: resolved.error });
+    return;
+  }
+  const source = resolved.source;
+  const content = String(msg.content ?? '').slice(0, 100_000);
+  const baseVersion = Number(msg.baseVersion);
+  if (!Number.isInteger(baseVersion) || baseVersion < 1) {
+    send(peer, { type: 'error', nodeId: source.id, message: '缺少改写所基于的版本号' });
+    return;
+  }
+
+  const id = crypto.randomUUID();
+  const result = store.createSuggestion(db, {
+    id,
+    nodeId: source.id,
+    content,
+    baseVersion,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'stale') {
+    send(peer, {
+      type: 'suggestion_stale',
+      nodeId: source.id,
+      current: result.latest,
+      message: '这段正文已有新版本，请刷新到最新内容后再提改写',
+    });
+    return;
+  }
+  if (result.status === 'noop') {
+    send(peer, {
+      type: 'suggestion_noop',
+      nodeId: source.id,
+      revision: result.latest,
+      message: '这版内容与当前正文相同，无需提出改写',
+    });
+    return;
+  }
+  if (result.status !== 'created') {
+    send(peer, { type: 'error', nodeId: source.id, message: '无法提出改写' });
+    return;
+  }
+  sendToDocs(audienceDocIds(source.id), {
+    type: 'suggestion_added',
+    nodeId: source.id,
+    suggestion: result.suggestion,
+  });
+}
+
+function handleSuggestionWithdraw(peer, msg) {
+  const suggestionId = String(msg.suggestionId || '');
+  const result = store.withdrawSuggestion(db, { suggestionId, userId: peer.user.userId });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', message: '改写不存在或已被处理' });
+    return;
+  }
+  if (result.status === 'forbidden') {
+    send(peer, { type: 'error', message: '只能撤掉自己提出的改写' });
+    return;
+  }
+  if (result.status !== 'withdrawn') {
+    send(peer, {
+      type: 'error',
+      nodeId: result.suggestion.nodeId,
+      message: '这版改写已被收下或失效，不能撤掉',
+    });
+    return;
+  }
+  // 撤稿只删公开草稿：不写 revision、不动正文，也不释放/影响段落编辑锁。
+  sendToDocs(audienceDocIds(result.suggestion.nodeId), {
+    type: 'suggestion_withdrawn',
+    nodeId: result.suggestion.nodeId,
+    suggestionId,
+  });
+}
+
+function handleSuggestionAccept(peer, msg) {
+  const suggestionId = String(msg.suggestionId || '');
+  const result = store.acceptSuggestion(db, {
+    suggestionId,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', message: '改写不存在或段落已删除' });
+    return;
+  }
+  const nodeId = result.suggestion?.nodeId;
+  if (result.status === 'not_pending') {
+    send(peer, {
+      type: 'suggestion_stale',
+      nodeId,
+      suggestionId,
+      message: '这版改写已被收下或撤掉',
+    });
+    return;
+  }
+  if (result.status === 'stale') {
+    sendToDocs(audienceDocIds(nodeId), {
+      type: 'suggestions_superseded',
+      nodeId,
+      suggestionIds: result.supersededIds,
+      reason: '正文已有新版本，请基于最新版本重新提出改写',
+    });
+    send(peer, {
+      type: 'suggestion_stale',
+      nodeId,
+      suggestionId,
+      current: result.latest,
+      message: '这版改写基于旧正文；为避免覆盖新改动，未收入正文',
+    });
+    return;
+  }
+  if (result.status === 'noop') {
+    sendToDocs(audienceDocIds(nodeId), {
+      type: 'suggestion_accepted',
+      nodeId,
+      suggestionId,
+      revision: result.revision,
+      by: peer.user,
+      noop: true,
+    });
+    return;
+  }
+  if (result.status !== 'saved') {
+    send(peer, { type: 'error', nodeId, message: '收下改写失败，请重试' });
+    return;
+  }
+
+  const audience = audienceDocIds(nodeId);
+  // 先发 accepted，再发正文；客户端据此移除被收的卡片并等待同一份 revision。
+  sendToDocs(audience, {
+    type: 'suggestion_accepted',
+    nodeId,
+    suggestionId,
+    by: peer.user,
+  });
+  if (result.supersededIds.length) {
+    sendToDocs(audience, {
+      type: 'suggestions_superseded',
+      nodeId,
+      suggestionIds: result.supersededIds,
+      reason: '同一段已收下另一版改写',
+    });
+  }
+  sendToDocs(audience, {
+    type: 'content',
+    nodeId,
+    docId: store.getNode(db, nodeId).doc_id,
+    version: result.revision.version,
+    content: result.revision.content,
+    author: result.revision.author,
+    authorId: result.revision.author_id,
+    updatedAt: result.revision.created_at,
+    acceptedBy: peer.user,
+    acceptedSuggestionId: suggestionId,
+  });
+}
+
 // ---------- 内容保存：版本号乐观锁 + diff3 三方合并 ----------
 // 无论编辑入口在源段落还是某个跟读，nodeId 永远是源节点 id
 // （跟读没有自己的正文），所以"两人在不同挂载点改同一段"就是
@@ -272,7 +448,7 @@ function handleSave(peer, msg) {
       userName: peer.user.userName,
     });
     if (result.status === 'saved') {
-      broadcastContent(nodeId, result.revision, peer.connId);
+      broadcastContent(nodeId, result.revision, peer.connId, result.supersededSuggestionIds);
       send(peer, { type: 'saved', nodeId, revision: result.revision, clientTag });
     } else if (result.status === 'noop') {
       send(peer, { type: 'saved', nodeId, revision: latest, merged: false, clientTag });
@@ -318,7 +494,7 @@ function handleSave(peer, msg) {
     note: `自动合并：基于 v${base.version} 与 v${latest.version}`,
   });
   if (result.status === 'saved') {
-    broadcastContent(nodeId, result.revision, peer.connId);
+    broadcastContent(nodeId, result.revision, peer.connId, result.supersededSuggestionIds);
     send(peer, {
       type: 'merge_notice',
       nodeId,
@@ -334,7 +510,7 @@ function handleSave(peer, msg) {
   }
 }
 
-function broadcastContent(nodeId, revision, exceptConnId = null) {
+function broadcastContent(nodeId, revision, exceptConnId = null, supersededSuggestionIds = []) {
   // 扇出到源文档与全部跟读宿主文档：同一份 revision，所有挂载点同步更新
   sendToDocs(audienceDocIds(nodeId), {
     type: 'content',
@@ -345,6 +521,18 @@ function broadcastContent(nodeId, revision, exceptConnId = null) {
     author: revision.author,
     authorId: revision.author_id,
     updatedAt: revision.created_at,
+  }, exceptConnId);
+  // 提议失效要通知保存者自己：否则他屏幕上会残留已被自己新正文顶掉的卡片。
+  broadcastSuggestionsSuperseded(nodeId, supersededSuggestionIds, null);
+}
+
+function broadcastSuggestionsSuperseded(nodeId, suggestionIds = [], exceptConnId = null, reason = '正文已更新为新版本') {
+  if (!suggestionIds.length) return;
+  sendToDocs(audienceDocIds(nodeId), {
+    type: 'suggestions_superseded',
+    nodeId,
+    suggestionIds,
+    reason,
   }, exceptConnId);
 }
 
@@ -405,7 +593,7 @@ function handleRestoreSave(peer, msg) {
   });
 
   if (result.status === 'saved') {
-    broadcastContent(nodeId, result.revision, peer.connId);
+    broadcastContent(nodeId, result.revision, peer.connId, result.supersededSuggestionIds);
     send(peer, {
       type: 'merge_notice', nodeId, revision: result.revision,
       message: latest.version !== restoreVersion
@@ -477,7 +665,7 @@ function handleResolve(peer, msg) {
     note: msg.keep === 'remote' ? '冲突解决：采用对方版本' : '冲突解决：手动合并',
   });
   if (result.status === 'saved') {
-    broadcastContent(nodeId, result.revision, peer.connId);
+    broadcastContent(nodeId, result.revision, peer.connId, result.supersededSuggestionIds);
     send(peer, { type: 'saved', nodeId, revision: result.revision, clientTag });
   } else if (result.status === 'noop') {
     // 最终文本与线上一致（例如采用对方版本）：已收敛，直接回执成功
@@ -726,6 +914,16 @@ function handleDelete(peer, msg) {
   for (const hostDocId of hostDocs) {
     sendToDoc(hostDocId, { type: 'source_deleted', sourceIds: result.ids });
   }
+  for (const suggestion of result.supersededSuggestions || []) {
+    if (suggestion?.nodeId) {
+      broadcastSuggestionsSuperseded(
+        suggestion.nodeId,
+        [suggestion.id],
+        null,
+        '段落已删除',
+      );
+    }
+  }
 }
 
 // ---------- WebSocket 生命周期 ----------
@@ -760,6 +958,9 @@ wss.on('connection', (ws) => {
         case 'lock': handleLock(peer, msg); break;
         case 'unlock': handleUnlock(peer, msg); break;
         case 'heartbeat': handleHeartbeat(peer, msg); break;
+        case 'suggestion_add': handleSuggestionAdd(peer, msg); break;
+        case 'suggestion_withdraw': handleSuggestionWithdraw(peer, msg); break;
+        case 'suggestion_accept': handleSuggestionAccept(peer, msg); break;
         case 'save': handleSave(peer, msg); break;
         case 'restore_save': handleRestoreSave(peer, msg); break;
         case 'resolve': handleResolve(peer, msg); break;

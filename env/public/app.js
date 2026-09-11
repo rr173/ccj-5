@@ -377,6 +377,7 @@ const state = {
   tabs: [],              // 已打开的文档 docId（有序）
   activeDocId: null,
   usersByDoc: new Map(), // docId -> Map(userId -> user)
+  proposals: new Map(),  // sourceId -> Map(suggestionId -> suggestion)
   historyNodeId: null,
   pendingFocus: null,    // { docId, nodeId, edit?:bool }，快照到达后滚动/进入编辑
   pendingNewDocId: null, // create_doc 后等待快照自动打开的文档
@@ -468,6 +469,30 @@ function rowsOfSource(sourceId) {
     }
   }
   return out;
+}
+
+function proposalsForSource(sourceId) {
+  const map = state.proposals.get(sourceId);
+  return map ? [...map.values()].sort((a, b) => a.createdAt - b.createdAt) : [];
+}
+
+function upsertProposal(suggestion) {
+  if (!suggestion || !suggestion.nodeId) return;
+  if (!state.proposals.has(suggestion.nodeId)) state.proposals.set(suggestion.nodeId, new Map());
+  state.proposals.get(suggestion.nodeId).set(suggestion.id, suggestion);
+  patchSource(suggestion.nodeId);
+}
+
+function removeProposal(sourceId, suggestionId) {
+  const map = state.proposals.get(sourceId);
+  if (map && map.delete(suggestionId)) patchSource(sourceId);
+}
+
+function removeProposals(sourceId, suggestionIds = []) {
+  let changed = false;
+  const map = state.proposals.get(sourceId);
+  for (const id of suggestionIds) changed = (map?.delete(id) || false) || changed;
+  if (changed) patchSource(sourceId);
 }
 
 /* ================= 登录 ================= */
@@ -683,6 +708,26 @@ function handleMessage(msg) {
     case 'content':
       applyContent(msg);
       break;
+    case 'suggestion_added':
+      upsertProposal(msg.suggestion);
+      break;
+    case 'suggestion_withdrawn':
+      removeProposal(msg.nodeId, msg.suggestionId);
+      break;
+    case 'suggestion_accepted':
+      removeProposal(msg.nodeId, msg.suggestionId);
+      if (!msg.noop) toast(`已收下 ${msg.by?.userName || '成员'} 的改写`, 'ok');
+      break;
+    case 'suggestions_superseded':
+      removeProposals(msg.nodeId, msg.suggestionIds || []);
+      break;
+    case 'suggestion_stale':
+      removeProposals(msg.nodeId, msg.suggestionId ? [msg.suggestionId] : []);
+      toast(msg.message || '这版改写已过期，请基于最新正文重新提出', 'error', 4200);
+      break;
+    case 'suggestion_noop':
+      toast(msg.message || '这版内容与当前正文相同', '');
+      break;
     case 'merge_notice':
       toast(msg.message || '已自动合并其他人的修改', 'ok');
       applyContent({
@@ -891,6 +936,12 @@ function ingestSnapshot(msg) {
     state.docs.get(docId).treeRev = msg.treeRev;
   }
   state.usersByDoc.set(docId, new Map((msg.users || []).map((u) => [u.userId, u])));
+  const visibleSources = new Set();
+  for (const node of nodes.values()) visibleSources.add(sourceIdOf(node));
+  for (const sourceId of visibleSources) {
+    const list = (msg.suggestions || []).filter((s) => s.nodeId === sourceId);
+    state.proposals.set(sourceId, new Map(list.map((s) => [s.id, s])));
+  }
 
   if (state.pendingNewDocId === docId) {
     // 新建文档的第一份快照：自动打开为标签页
@@ -1038,6 +1089,7 @@ function applyDeleted(msg) {
     view.nodes.delete(id);
     view.locks.delete(id);
     view.lockInfo?.delete(id);
+    state.proposals.delete(id);
   }
   reindex(view);
   if (edit.sourceId && msg.ids.includes(edit.sourceId)) {
@@ -1062,6 +1114,7 @@ function applySourceDeleted(msg) {
         view.lockInfo?.delete(sourceId);
       }
     }
+    state.proposals.delete(sourceId);
     if (edit.sourceId === sourceId) stopEditing('跟读的源段落已被删除');
   }
 }
@@ -1222,6 +1275,7 @@ function renderNodeRow(view, node) {
     if (!node.sourceDeleted) {
       actions.append(
         actionBtn('编辑', () => beginEdit(node.id)),
+        actionBtn('提改写', () => openSuggestionComposer(node.id)),
         actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
       );
     } else {
@@ -1234,6 +1288,7 @@ function renderNodeRow(view, node) {
   } else {
     actions.append(
       actionBtn('编辑', () => beginEdit(node.id)),
+      actionBtn('提改写', () => openSuggestionComposer(node.id)),
       actionBtn('＋子级', () => addNode(node.id, null)),
       actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
       actionBtn('挂跟读', () => openMirrorPicker(node)),
@@ -1242,6 +1297,11 @@ function renderNodeRow(view, node) {
   }
   row.appendChild(actions);
   el.appendChild(row);
+
+  if (!(node.kind === 'mirror' && node.sourceDeleted)) {
+    const proposals = proposalsForSource(sourceId);
+    if (proposals.length) el.appendChild(renderSuggestionList(node, sourceId, proposals));
+  }
 
   // 元信息行
   const meta = document.createElement('div');
@@ -1306,6 +1366,40 @@ function renderNodeRow(view, node) {
   }
   el.appendChild(meta);
   return el;
+}
+
+function renderSuggestionList(node, sourceId, proposals) {
+  const box = document.createElement('div');
+  box.className = 'suggestion-list';
+  for (const proposal of proposals) {
+    const card = document.createElement('div');
+    card.className = 'suggestion-card' +
+      (state.me && proposal.authorId === state.me.userId ? ' mine' : '');
+    card.dataset.suggestionId = proposal.id;
+
+    const head = document.createElement('div');
+    head.className = 'suggestion-head';
+    const who = document.createElement('span');
+    who.innerHTML =
+      `<strong>${escapeHtml(proposal.author || '匿名成员')}</strong>` +
+      ` <span class="muted">基于 v${proposal.baseVersion} 提出</span>`;
+    head.appendChild(who);
+
+    const text = document.createElement('div');
+    text.className = 'suggestion-text';
+    text.textContent = proposal.content || '（空内容）';
+
+    const tools = document.createElement('div');
+    tools.className = 'suggestion-tools';
+    tools.append(actionBtn('收下这版', () => acceptSuggestion(proposal), false));
+    if (state.me && proposal.authorId === state.me.userId) {
+      tools.append(actionBtn('撤掉', () => withdrawSuggestion(proposal), true));
+    }
+
+    card.append(head, text, tools);
+    box.appendChild(card);
+  }
+  return box;
 }
 
 function actionBtn(label, onClick, danger = false) {
@@ -1865,6 +1959,64 @@ $('#mirror-confirm').addEventListener('click', () => {
   }
   $('#mirror-mask').classList.add('hidden');
 });
+
+/* ================= 改写提议 ================= */
+
+const suggestionComposer = { sourceId: null, baseVersion: 0, requestId: 0 };
+
+function openSuggestionComposer(nodeId) {
+  if (!requireOnline()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  const sourceId = sourceIdOf(found.node);
+  const sourceRow = rowsOfSource(sourceId).find((r) => r.node.kind !== 'mirror')?.node || found.node;
+  suggestionComposer.sourceId = sourceId;
+  suggestionComposer.baseVersion = sourceRow.version;
+  $('#suggestion-content').value = sourceRow.content || '';
+  $('#suggestion-help').textContent =
+    `基于当前 v${sourceRow.version} 提出；在有人收下前，正文和所有跟读仍保持线上版本。`;
+  $('#suggestion-mask').classList.remove('hidden');
+  $('#suggestion-content').focus();
+}
+
+function closeSuggestionComposer() {
+  $('#suggestion-mask').classList.add('hidden');
+  suggestionComposer.sourceId = null;
+  suggestionComposer.baseVersion = 0;
+}
+
+$('#suggestion-cancel').addEventListener('click', closeSuggestionComposer);
+$('#suggestion-mask').addEventListener('click', (e) => {
+  if (e.target === $('#suggestion-mask')) closeSuggestionComposer();
+});
+$('#suggestion-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!suggestionComposer.sourceId) return;
+  if (!requireOnline()) return;
+  const requestId = ++suggestionComposer.requestId;
+  const payload = {
+    type: 'suggestion_add',
+    nodeId: suggestionComposer.sourceId,
+    content: $('#suggestion-content').value,
+    baseVersion: suggestionComposer.baseVersion,
+  };
+  if (!send(payload)) return;
+  // 服务器广播 suggestion_added 时由消息处理器统一落卡片；这里先关闭弹窗。
+  setTimeout(() => {
+    if (requestId === suggestionComposer.requestId) closeSuggestionComposer();
+  }, 0);
+});
+
+function withdrawSuggestion(proposal) {
+  if (!confirm('撤掉这版改写？正文不会变化。')) return;
+  send({ type: 'suggestion_withdraw', suggestionId: proposal.id });
+}
+
+function acceptSuggestion(proposal) {
+  if (!requireOnline()) return;
+  if (!confirm('收下这版改写？收下后正文和所有跟读会立即统一为这一版。')) return;
+  send({ type: 'suggestion_accept', suggestionId: proposal.id });
+}
 
 /* ================= 历史与回退 ================= */
 
