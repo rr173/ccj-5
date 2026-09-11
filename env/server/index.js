@@ -32,6 +32,13 @@ const app = express();
 app.use(express.json({ limit: '256kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
+// 对外定稿页（只读观看者入口）；必须在 SPA 兜底之前
+app.get('/published', (_req, res) =>
+  res.sendFile(path.join(__dirname, '..', 'public', 'published.html')),
+);
+app.get(/^\/published\/$/, (_req, res) =>
+  res.sendFile(path.join(__dirname, '..', 'public', 'published.html')),
+);
 // SPA 兜底
 app.get(/^(?!\/api).*/, (_req, res) =>
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html')),
@@ -62,6 +69,32 @@ function sendToDoc(docId, msg, exceptConnId = null) {
     if (!peer.rooms || !peer.rooms.has(docId)) continue;
     if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data);
   }
+}
+
+// 对外定稿观看者房间：viewer 只收定稿相关消息，工作稿的任何增量都不扇出到这里。
+function sendToViewers(docId, msg, exceptConnId = null) {
+  const data = JSON.stringify(msg);
+  for (const [connId, peer] of peers) {
+    if (connId === exceptConnId) continue;
+    if (!peer.viewRooms || !peer.viewRooms.has(docId)) continue;
+    if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data);
+  }
+}
+
+// 定稿状态变化：观看者整树替换，编辑者同步顶栏的定稿信息。
+function broadcastPublication(publication, exceptConnId = null) {
+  const msg = {
+    type: 'published_changed',
+    docId: publication.docId,
+    pubSeq: publication.pubSeq,
+    timelineSeq: publication.timelineSeq,
+    title: publication.title,
+    nodes: publication.nodes,
+    by: { userId: publication.authorId, userName: publication.author },
+    createdAt: publication.createdAt,
+  };
+  sendToViewers(publication.docId, msg, exceptConnId);
+  sendToDoc(publication.docId, msg, exceptConnId);
 }
 
 function sendToDocs(docIds, msg, exceptConnId = null) {
@@ -103,6 +136,7 @@ function resolveEditable(nodeId) {
 
 function snapshotMessage(docId) {
   const snap = store.getSnapshot(db, docId);
+  const pub = store.getCurrentPublication(db, docId);
   return {
     type: 'snapshot',
     docId: snap.doc.id,
@@ -112,6 +146,15 @@ function snapshotMessage(docId) {
     locks: relevantLocks(docId, snap.nodes),
     suggestions: relevantSuggestions(snap.nodes),
     users: presenceList(docId),
+    published: pub
+      ? {
+          pubSeq: pub.pubSeq,
+          timelineSeq: pub.timelineSeq,
+          title: pub.title,
+          by: { userId: pub.authorId, userName: pub.author },
+          createdAt: pub.createdAt,
+        }
+      : null,
   };
 }
 
@@ -143,14 +186,155 @@ function docListMessage() {
 
 function handleHello(peer, msg) {
   const userId = String(msg.userId || crypto.randomUUID());
-  const userName = String(msg.userName || '匿名用户').slice(0, 40);
+  const userName = String(msg.userName || (msg.role === 'viewer' ? '外部观看者' : '匿名用户')).slice(0, 40);
+  const role = msg.role === 'viewer' ? 'viewer' : 'editor';
   peer.user = { userId, userName, color: colorFor(userId) };
+  peer.role = role;
   peer.rooms = new Set();
-  send(peer, { type: 'hello', user: peer.user });
+  peer.viewRooms = new Set();
+  send(peer, { type: 'hello', user: peer.user, role });
+
+  // 对外定稿页：hello 即带上要观看的文档，直接进观看房间，永远拿不到工作稿
+  if (role === 'viewer') {
+    const docId = String(msg.docId || '');
+    if (docId) joinViewRoom(peer, docId);
+    return;
+  }
+
   send(peer, docListMessage());
 
   // 进入即打开默认大纲（保持单文档时代的交互/旧协议兼容）
   joinDoc(peer, store.DEFAULT_DOC);
+}
+
+// ---------- 对外定稿：观看房间（只读） ----------
+
+function publishedStateMessage(docId) {
+  const pub = store.getCurrentPublication(db, docId);
+  if (!pub) {
+    const doc = store.getDoc(db, docId);
+    return {
+      type: 'published_state',
+      docId,
+      pubSeq: 0,
+      title: doc ? doc.title : '',
+      nodes: null, // null = 从未定稿，观看端显示空状态，绝不回退到工作稿
+    };
+  }
+  return {
+    type: 'published_state',
+    docId,
+    pubSeq: pub.pubSeq,
+    timelineSeq: pub.timelineSeq,
+    title: pub.title,
+    nodes: pub.nodes,
+    by: { userId: pub.authorId, userName: pub.author },
+    createdAt: pub.createdAt,
+  };
+}
+
+function joinViewRoom(peer, docId) {
+  const doc = store.getDoc(db, docId);
+  if (!doc) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  peer.viewRooms.add(docId);
+  send(peer, publishedStateMessage(docId));
+  sendToViewers(docId, { type: 'presence', docId, scope: 'published', users: viewerPresence(docId) }, peer.connId);
+}
+
+function viewerPresence(docId) {
+  const out = [];
+  for (const peer of peers.values()) {
+    if (peer.viewRooms && peer.viewRooms.has(docId)) out.push(peer.user);
+  }
+  return out;
+}
+
+function handleOpenPublished(peer, msg) {
+  const docId = String(msg.docId || '');
+  if (!store.getDoc(db, docId)) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  if (!peer.viewRooms.has(docId)) {
+    joinViewRoom(peer, docId);
+  } else {
+    send(peer, publishedStateMessage(docId));
+  }
+}
+
+function handleLeavePublished(peer, msg) {
+  const docId = String(msg.docId || '');
+  if (peer.viewRooms.delete(docId)) {
+    sendToViewers(docId, { type: 'presence', docId, scope: 'published', users: viewerPresence(docId) });
+  }
+}
+
+// ---------- 定稿（发布）：只有编辑者；CAS 防并发双定 ----------
+
+function handlePublish(peer, msg) {
+  if (peer.role === 'viewer') {
+    send(peer, { type: 'error', message: '对外定稿页是只读的' });
+    return;
+  }
+  const docId = String(msg.docId || '');
+  const doc = store.getDoc(db, docId);
+  if (!doc) {
+    send(peer, { type: 'error', message: '大纲不存在' });
+    return;
+  }
+  const basePubSeq = Number(msg.basePubSeq);
+  if (!Number.isInteger(basePubSeq) || basePubSeq < 0) {
+    send(peer, { type: 'error', docId, message: '缺少定稿基准序号' });
+    return;
+  }
+  const result = store.publishDoc(db, {
+    docId,
+    basePubSeq,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', docId, message: '大纲不存在' });
+    return;
+  }
+  if (result.status === 'stale') {
+    // 别人刚定过一版：把最新定稿带给后来者，由他确认后基于新版重新定
+    send(peer, {
+      type: 'publish_stale',
+      docId,
+      current: result.current
+        ? {
+            pubSeq: result.current.pubSeq,
+            title: result.current.title,
+            by: result.current.author,
+            createdAt: result.current.createdAt,
+          }
+        : { pubSeq: 0 },
+      message: '在你确认期间已有人定出新版，请看一眼当前定稿后再决定是否把工作稿重新定出去',
+    });
+    return;
+  }
+  if (result.status === 'unchanged') {
+    send(peer, {
+      type: 'published_ack',
+      docId,
+      pubSeq: result.publication.pubSeq,
+      unchanged: true,
+      message: '工作稿与当前定稿一致，没有产生新版本',
+    });
+    return;
+  }
+
+  send(peer, {
+    type: 'published_ack',
+    docId,
+    pubSeq: result.publication.pubSeq,
+    timelineSeq: result.publication.timelineSeq,
+  });
+  broadcastPublication(result.publication);
 }
 
 function joinDoc(peer, docId) {
@@ -930,7 +1114,7 @@ function handleDelete(peer, msg) {
 
 wss.on('connection', (ws) => {
   const connId = crypto.randomUUID();
-  const peer = { connId, ws, user: null, rooms: new Set(), alive: true };
+  const peer = { connId, ws, user: null, rooms: new Set(), viewRooms: new Set(), role: 'editor', alive: true };
   peers.set(connId, peer);
 
   ws.on('pong', () => {
@@ -948,12 +1132,20 @@ wss.on('connection', (ws) => {
       send(peer, { type: 'error', message: '请先发送 hello' });
       return;
     }
+    // 对外观看者：除观看房间的只读消息外，一律拒绝（安全边界在服务器，不靠前端自觉）
+    if (peer.role === 'viewer' && !['open_published', 'leave_published', 'heartbeat'].includes(msg.type)) {
+      send(peer, { type: 'error', message: '对外定稿页是只读的，不能修改大纲' });
+      return;
+    }
     try {
       switch (msg.type) {
         case 'hello': handleHello(peer, msg); break;
         case 'open_doc': handleOpenDoc(peer, msg); break;
         case 'leave_doc': handleLeaveDoc(peer, msg); break;
         case 'create_doc': handleCreateDoc(peer, msg); break;
+        case 'open_published': handleOpenPublished(peer, msg); break;
+        case 'leave_published': handleLeavePublished(peer, msg); break;
+        case 'publish': handlePublish(peer, msg); break;
         case 'add_mirror': handleAddMirror(peer, msg); break;
         case 'lock': handleLock(peer, msg); break;
         case 'unlock': handleUnlock(peer, msg); break;
@@ -989,6 +1181,11 @@ wss.on('connection', (ws) => {
     for (const docId of [...peer.rooms]) {
       peer.rooms.delete(docId);
       sendToDoc(docId, { type: 'presence', docId, users: presenceList(docId) });
+    }
+    // 离开对外定稿观看房间，更新观看者名单
+    for (const docId of [...peer.viewRooms]) {
+      peer.viewRooms.delete(docId);
+      sendToViewers(docId, { type: 'presence', docId, scope: 'published', users: viewerPresence(docId) });
     }
   });
 

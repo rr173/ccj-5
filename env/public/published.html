@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>对外定稿</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="published-body">
+  <div id="pub-app" class="pub-app">
+    <header class="topbar pub-topbar">
+      <div class="title-wrap">
+        <span class="pub-badge">对外定稿</span>
+        <h2 id="pub-title">加载中…</h2>
+        <span id="pub-conn" class="conn-dot" title="连接状态"></span>
+      </div>
+      <div class="top-actions">
+        <span id="pub-meta" class="pub-meta"></span>
+        <div id="pub-users" class="users"></div>
+      </div>
+    </header>
+
+    <div id="pub-stale-hint" class="pub-stale-hint hidden">
+      定稿已更新，正在切换到最新一版…
+    </div>
+
+    <main class="main">
+      <div class="outline-wrap">
+        <div id="pub-outline"></div>
+        <div id="pub-empty" class="pub-empty hidden">
+          <h3>这份大纲还没有定过稿</h3>
+          <p class="muted">编辑把工作稿「定出去」之后，这里才会出现内容；在此之前看不到工作稿。</p>
+        </div>
+        <div id="pub-loading" class="pub-empty">
+          <p class="muted">正在连接…</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast-host" class="toast-host"></div>
+  <script src="/published.js"></script>
+</body>
+</html>

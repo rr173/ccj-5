@@ -27,6 +27,7 @@
       </div>
       <div class="top-actions">
         <span id="editing-hint" class="editing-hint hidden"></span>
+        <button id="publish-btn" class="publish-chip none" title="把当前工作稿定成对外版本">📢 定稿</button>
         <button id="timeline-btn" class="ghost" title="按时刻回看整份大纲">🕘 时间轴</button>
         <div id="users" class="users"></div>
       </div>
@@ -122,6 +123,22 @@
       <div class="conflict-actions">
         <button type="button" id="suggestion-cancel" class="ghost">取消</button>
         <button type="submit" class="primary">提出改写</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 定稿确认弹窗：不点确认绝不发 publish，反悔成本为零 -->
+  <div id="publish-mask" class="conflict-mask hidden">
+    <form id="publish-form" class="newdoc-card">
+      <h3>把当前工作稿定成对外版本？</h3>
+      <p class="muted" id="publish-help"></p>
+      <div id="publish-current" class="publish-current"></div>
+      <label class="final-label">
+        <input type="checkbox" id="publish-open" /> 定稿后打开对外定稿页（只读链接，可直接发给外面的人）
+      </label>
+      <div class="conflict-actions">
+        <button type="button" id="publish-cancel" class="ghost">再改改（不定稿）</button>
+        <button type="submit" class="primary">确认定稿</button>
       </div>
     </form>
   </div>

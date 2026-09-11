@@ -10,6 +10,7 @@
 | 断线后还能继续改 | 离线保存进 **localStorage 队列**（同段自动合并成一条，保留最初基准版本），本地乐观显示+「待同步」徽章，刷新/关页面不丢；重连拿到新快照后**逐条自动回放**（带 `clientTag` 对号回执），不撞的走 diff3 自动合并全员广播；撞上的段落**挂红徽章明示"当前以线上（谁的 v几）为准"**，点徽章弹裁决窗，裁决后全员逐字一致 |
 | 按整份来回看时间 | 结构与内容共用一张 append-only `timeline`（全局单调 seq 即"时刻"）：任意时刻可重建**整棵树的层级+正文**；跟读行投影源在**同一时刻**的内容，源这份和跟读这份严格对照，所有人看到同一份 |
 | 从旧时刻接着改 | 不是覆盖，而是**另开一条线**：该时刻的正文载入草稿，保存时以旧版本为共同祖先做三方合并（diff4）——现在这条线上别人后来写下、没撞上的改动自动保留；两人从同一时刻接着改，仍走合并/冲突裁决收敛成同一份 |
+| 对外定稿 | 工作稿（编辑们实时协同这份）与**对外定稿**（不可变快照）严格分开：外面的人打开 `/published/` 只读页，只看最近一次「定稿」冻结下来的整树内容，工作稿怎么改都不外泄；再点一次定稿，发布在**单个事务**里原子切换并向所有观看者推送同一份新快照；并发定稿靠 `basePubSeq` 乐观锁——两人同时定，只有一个成功，另一个收到 `publish_stale` 重确认，不存在"两边都定出去了却对不上"；没点确认绝不产生新版本，反悔零成本，外面始终停在上一版 |
 | Docker 部署 | 单镜像 + 一个命名卷，`docker compose up -d` |
 
 > 锁只是**协作提示**，不参与正确性。即使绕过锁（或锁刚好过期时两人同时提交），
@@ -54,8 +55,9 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（16 + 11 + 7 个场景）+ 离线续改端到端 + 单元测试
+npm test                  # WebSocket 端到端（16 + 6 + 11 + 7 + 8 个场景）+ 离线续改端到端 + 单元测试
 node test/offline.e2e.test.js             # 离线续改：真实客户端 + 服务器停启 + 重连对齐全流程
+node test/published.e2e.test.js           # 对外定稿：隔离/冻结/原子切换/并发 CAS/只读边界/跟读冻结
 node test/client.smoke.test.js            # jsdom 客户端冒烟：多文档 + 跟读全流程
 node test/client.timetravel.smoke.test.js # jsdom 客户端冒烟：整份时间轴回看全流程
 node test/fraction.test.js        # 分数索引：6000 次随机插入顺序不变
@@ -101,6 +103,15 @@ clientTag 回执对号、未保存草稿落盘）。
   「当前以线上（谁的 v几）为准」**，点徽章或顶栏胶囊打开裁决窗选最终内容。
   没保存的草稿也随输入落盘，下次打开同一段会提示恢复。
   离线时增/删/移动/挂跟读这类**结构改动不能暂存**（树版本锁无法离线对齐），会明确提示联网后再试。
+- **对外定稿**：顶栏「📢 定稿」把**当前工作稿**冻结成对外版本（确认弹窗里可勾选"定稿后打开对外页"）。
+  - 外面的人打开 `http://<站点>/published/?doc=<文档id>`（默认文档可省略参数），是**纯只读页**：
+    没有登录、没有任何编辑入口；服务器把这种连接标记为 `viewer`，只推送定稿快照，
+    工作稿的正文、结构、锁、改写提议一律不扇出，viewer 发来的写消息也被服务器直接拒绝。
+  - 还没定过稿时对外页只显示"尚未定稿"，**不会**把工作稿漏出去。
+  - 定稿之后编辑照常改工作稿，对外页纹丝不动；下次定稿时所有开着对外页的人**整树替换**到新版，
+    不会出现半新半旧。顶栏胶囊显示当前对外是第几版、谁定的、什么时候。
+  - 跟读行在定稿时把当时投影的正文**内嵌冻结**：对外那份自包含，源文档之后怎么改甚至删除都不影响它。
+  - 内容与上一版完全相同的定稿不产生新版本（回执 `unchanged`），两个人对着同一份内容重复点也算同一版。
 
 ---
 
@@ -118,7 +129,8 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
                       ├── documents  (tree_rev 结构乐观锁)
                       ├── nodes      (parent_id, pos, deleted 软删)
                       ├── revisions  (node_id, version 单调, content, author, note)
-                      └── timeline   (全局 seq 时刻：结构+内容事件，整树可重建)
+                      ├── timeline   (全局 seq 时刻：结构+内容事件，整树可重建)
+                      └── publications (pub_seq 定稿版本, base_seq CAS, timeline_seq, snapshot 冻结 JSON)
 ```
 
 ### 收敛协议要点
@@ -168,6 +180,7 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 
 ```
 hello {userId, userName}
+hello {userId, userName, role:'viewer', docId}  # 对外定稿页：只读观看者，只进 view 房间
 lock {nodeId}            unlock {nodeId}
 heartbeat {nodeId?}
 save {nodeId, content, baseVersion, clientTag?}
@@ -176,6 +189,9 @@ resolve {nodeId, content, keep, clientTag?}                  # 冲突裁决
 history {nodeId}
 timeline                                         # 拉整份时间轴（全局事件流）
 snapshot_at {docId, seq}                         # 把某份大纲重建到时刻 seq
+publish {docId, basePubSeq}                      # 把当前工作稿定为对外新版（CAS：basePubSeq=看到的当前定稿序号，首次为 0）
+open_published {docId}                           # 观看者：进入对外定稿房间（只读）
+leave_published {docId}
 add {parentId, afterId, content, treeRev}
 move {nodeId, parentId, afterId, treeRev}
 delete {nodeId, treeRev}
@@ -188,7 +204,11 @@ delete {nodeId, treeRev}
 
 ```
 hello {user}
-snapshot {title, treeRev, nodes[], locks[], users[]}
+snapshot {title, treeRev, nodes[], locks[], users[], published?}
+published_state {docId, pubSeq, title, nodes|null, by?, createdAt?}  # 观看者初始；nodes=null=从未定稿
+published_changed {docId, pubSeq, timelineSeq, title, nodes[], by, createdAt}  # 定稿原子切换：编辑者+观看者都收
+published_ack {docId, pubSeq, unchanged?}    # 定稿成功回执（只回发布者本人；其他人收 published_changed）
+publish_stale {docId, current{pubSeq,...}}   # 并发定稿输了：基准过期，确认后基于新版重试
 presence {users[]}
 locked {nodeId, user}                  # 别人拿到锁（不会回发给持有者本人）
 lock_acquired {nodeId, reacquired}     # 你拿到/重新拿到锁
@@ -213,6 +233,23 @@ error {message}
 
 ## 语义边界（刻意的设计选择）
 
+- **定稿是整树快照，不是视图开关**：每次定稿把当时的层级、正文（含跟读投影）序列化成
+  一行不可变 JSON 存进 `publications`。工作稿之后的增删改与已定稿的内容互不影响；
+  "外面"永远只读当前最大 `pub_seq` 那一行，不存在中间状态。
+- **并发定稿只可能一个赢**：`publish` 必须带 `basePubSeq`（客户端看到的当前定稿序号），
+  与文档当前值不一致的请求在同一 SQLite 事务里被拒为 `publish_stale`。
+  输的人先看到新版、再决定要不要基于新版重新定稿——与段落保存的乐观锁同一思路，
+  从机制上杜绝"两边都显示定出去了却对不上"。
+- **定稿是显式动作**：打开确认弹窗不等于定稿，只有点了「确认定稿」才发请求；
+  取消/关弹窗什么都不发生，外面看到的还是上一版。
+- **只读边界在服务器**：`role:'viewer'` 的连接被放进独立的 `view:<docId>` 房间，
+  工作稿消息从不扇出到该房间；任何写/锁消息在消息分发入口直接拒绝。
+  前端没有编辑入口只是体验，不是安全依赖。
+- **对外页不暴露未发布内容**：从未定稿时 `published_state.nodes = null`，页面显示空状态；
+  不会为了"别让页面空着"而回退展示工作稿。
+- **跟读在定稿时按当时投影冻结**：对外快照自包含，源段落之后被改/被删都不改变已定稿内容。
+- **定稿不进 timeline**：timeline 只描述工作稿的演进；定稿是工作稿在某时刻的"出口事件"，
+  用自己的 `publications` 表与 `pub_seq` 序号，回看时刻坐标（全局 seq）保持单一含义。
 - **离线暂存只覆盖段落正文**：增/删/移动/挂跟读这类结构改动依赖文档级 `tree_rev`
   乐观锁，离线时无法安全暂存，客户端会明确拦下并提示联网后再试；
   正文编辑则自动落本机队列，联网后对齐。

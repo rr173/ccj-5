@@ -395,6 +395,11 @@ const timeTravel = {
 };
 const timelineCache = { items: [], latestSeq: 0 };
 
+// 当前每份大纲"已经定出去"的那一版（来自快照 / published_changed / published_ack）。
+// 这是发布的 CAS 基准：点定稿时把它看到的 pubSeq 带上，服务器据此拒绝并发的第二个定稿。
+// key: docId -> { pubSeq, title, by:{userId,userName}, createdAt, timelineSeq } | null
+const publishedByDoc = new Map();
+
 const $ = (sel) => document.querySelector(sel);
 
 /* ================= 工具 ================= */
@@ -798,6 +803,53 @@ function handleMessage(msg) {
       toast('树结构刚被别人改过，已为你刷新', 'error');
       // snapshot 紧随其后
       break;
+    case 'published_changed':
+      // 有人（可能就是另一个标签页里的自己）定出新版：更新基准与顶栏。
+      // 正在确认弹窗里的人保留弹窗：提交时会被 CAS 拦下并提示，不会静默覆盖。
+      publishedByDoc.set(msg.docId, {
+        pubSeq: msg.pubSeq,
+        title: msg.title,
+        by: msg.by || null,
+        createdAt: msg.createdAt || null,
+        timelineSeq: msg.timelineSeq || 0,
+      });
+      if (msg.docId === state.activeDocId) renderPublishChip();
+      if (msg.by?.userId !== state.me?.userId) {
+        toast(`${msg.by?.userName || '有人'} 已把工作稿定为对外第 ${msg.pubSeq} 版`, 'ok', 3600);
+      }
+      break;
+    case 'published_ack':
+      $('#publish-btn')?.classList.remove('busy');
+      // 正常发布：服务器的 published_changed 广播不带自己，用 ack 落本地基准
+      if (!msg.unchanged) {
+        publishedByDoc.set(msg.docId, {
+          pubSeq: msg.pubSeq,
+          title: state.docs.get(msg.docId)?.title || '',
+          by: state.me ? { userId: state.me.userId, userName: state.me.userName } : null,
+          createdAt: Date.now(),
+          timelineSeq: msg.timelineSeq || 0,
+        });
+        if (msg.docId === state.activeDocId) renderPublishChip();
+      }
+      $('#publish-mask').classList.add('hidden');
+      if ($('#publish-open').checked) openPublishedPage(msg.docId);
+      $('#publish-open').checked = false;
+      break;
+    case 'publish_stale':
+      $('#publish-btn')?.classList.remove('busy');
+      // 并发定稿输了：先看新定稿，再决定要不要基于新版重新定
+      if (msg.current?.pubSeq) {
+        publishedByDoc.set(msg.docId || state.activeDocId, {
+          pubSeq: msg.current.pubSeq,
+          title: msg.current.title || '',
+          by: { userId: '', userName: msg.current.by || '' },
+          createdAt: msg.current.createdAt || null,
+        });
+        renderPublishChip();
+      }
+      toast(msg.message || '定稿期间已有更新版本，请重新确认', 'error', 5200);
+      $('#publish-mask').classList.add('hidden');
+      break;
     case 'heartbeat_ack':
       if (msg.ok === false && edit.sourceId === msg.nodeId && edit.hasLock) {
         edit.hasLock = false;
@@ -936,6 +988,17 @@ function ingestSnapshot(msg) {
     state.docs.get(docId).treeRev = msg.treeRev;
   }
   state.usersByDoc.set(docId, new Map((msg.users || []).map((u) => [u.userId, u])));
+  if (msg.published) {
+    publishedByDoc.set(docId, {
+      pubSeq: msg.published.pubSeq,
+      title: msg.published.title || msg.title,
+      by: msg.published.by || null,
+      createdAt: msg.published.createdAt || null,
+      timelineSeq: msg.published.timelineSeq || 0,
+    });
+  } else {
+    publishedByDoc.set(docId, null);
+  }
   const visibleSources = new Set();
   for (const node of nodes.values()) visibleSources.add(sourceIdOf(node));
   for (const sourceId of visibleSources) {
@@ -1229,7 +1292,80 @@ function renderActiveDoc() {
   renderSyncState();
   $('#add-root').disabled = !state.activeDocId || timeTravel.active;
   updateEditingHint();
+  renderPublishChip();
 }
+
+/* ================= 对外定稿 ================= */
+
+function currentPublished(docId = state.activeDocId) {
+  return publishedByDoc.get(docId) || null;
+}
+
+function renderPublishChip() {
+  const btn = $('#publish-btn');
+  if (!btn) return;
+  const docId = state.activeDocId;
+  if (!docId || timeTravel.active) {
+    btn.classList.add('hidden');
+    return;
+  }
+  btn.classList.remove('hidden');
+  const pub = currentPublished(docId);
+  if (pub) {
+    btn.classList.remove('none');
+    btn.textContent = `📢 对外已定稿 v${pub.pubSeq}`;
+    btn.title = `对外第 ${pub.pubSeq} 版，${pub.by?.userName || ''} 定稿于 ${fmtTime(pub.createdAt)}。点击可把当前工作稿定为新版，或打开对外页`;
+  } else {
+    btn.classList.add('none');
+    btn.textContent = '📢 定稿';
+    btn.title = '工作稿还没定过稿；定稿后外面才看得到';
+  }
+}
+
+function openPublishedPage(docId) {
+  const url = `/published/?doc=${encodeURIComponent(docId)}`;
+  window.open(url, '_blank', 'noopener');
+}
+
+$('#publish-btn').addEventListener('click', () => {
+  const docId = state.activeDocId;
+  if (!docId || !requireOnline()) return;
+  if (edit.sourceId) {
+    toast('请先保存或取消当前编辑再定稿', 'error');
+    return;
+  }
+  const pub = currentPublished(docId);
+  const view = viewOf(docId);
+  const help = $('#publish-help');
+  const cur = $('#publish-current');
+  help.textContent = '定稿会把此刻工作稿的完整层级和正文冻结成对外版本。定稿之后你可以继续改工作稿，外面看到的仍是这一版，直到下次定稿。';
+  if (pub) {
+    cur.innerHTML = `外面现在看到的是 <b>第 ${pub.pubSeq} 版</b>` +
+      `（${pub.by?.userName ? escapeHtml(pub.by.userName) + ' ' : ''}定稿于 ${fmtTime(pub.createdAt)}）。` +
+      `本次确认后将替换为<b>第 ${pub.pubSeq + 1} 版</b>，所有正在看对外页的人会立刻切到新版。`;
+  } else {
+    cur.innerHTML = '这份大纲<b>还没有定过稿</b>。确认后产生对外第 1 版；在此之前对外页只显示"尚未定稿"。';
+  }
+  $('#publish-open').checked = false;
+  $('#publish-mask').classList.remove('hidden');
+  void view;
+});
+
+$('#publish-cancel').addEventListener('click', () => $('#publish-mask').classList.add('hidden'));
+$('#publish-mask').addEventListener('click', (e) => {
+  if (e.target === $('#publish-mask')) $('#publish-mask').classList.add('hidden');
+});
+$('#publish-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const docId = state.activeDocId;
+  if (!docId) return;
+  if (!requireOnline()) return;
+  // 反悔只发生在点确认之前：到这里才发 publish；basePubSeq 是我们看到的最新定稿
+  const pub = currentPublished(docId);
+  const basePubSeq = pub ? pub.pubSeq : 0;
+  $('#publish-btn').classList.add('busy');
+  send({ type: 'publish', docId, basePubSeq });
+});
 
 function renderOutline() {
   const root = $('#outline');

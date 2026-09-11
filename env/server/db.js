@@ -88,6 +88,26 @@ function init(dbFile) {
     );
     CREATE INDEX IF NOT EXISTS idx_timeline_doc ON timeline(doc_id, seq);
     CREATE INDEX IF NOT EXISTS idx_timeline_node ON timeline(node_id, seq);
+
+    -- 对外定稿：每次「定出去」追加一行，snapshot 是发布时刻整树（含跟读投影
+    -- 后的正文）的冻结副本。定稿一旦写入就不可变；工作稿之后的任何修改都与它
+    -- 无关。当前对外版本 = 该文档 pub_seq 最大的一行。
+    -- base_seq 是乐观锁（CAS）：并发定稿时只有基于"当前最新定稿"的那一个能成功，
+    -- 后来者收到 stale，保证不存在"两边都显示定出去了却对不上"。
+    CREATE TABLE IF NOT EXISTS publications (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id      TEXT NOT NULL,
+      pub_seq     INTEGER NOT NULL,   -- 该文档内单调的定稿版本号，从 1 开始
+      base_seq    INTEGER NOT NULL,   -- 定稿者看到的上一版定稿（0 = 首次定稿）
+      timeline_seq INTEGER NOT NULL,  -- 冻结时工作稿对应的全局时刻
+      title       TEXT NOT NULL,      -- 定稿时刻的标题（标题不参与回看，这里一并冻结）
+      snapshot    TEXT NOT NULL,      -- JSON：{ nodes: [...] }，结构与 snapshot 消息一致
+      author_id   TEXT NOT NULL,
+      author      TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      UNIQUE(doc_id, pub_seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_publications_doc ON publications(doc_id, pub_seq);
   `);
 
   // 旧库迁移：补 mirror_of 列（必须先于该列的索引创建）
@@ -817,6 +837,129 @@ function getSnapshotAt(db, docId, seq) {
   return { doc, asOf: { seq: at, createdAt: atRow ? atRow.createdAt : null, latestSeq: maxSeq }, nodes };
 }
 
+// ---------- 对外定稿（发布）----------
+//
+// 工作稿（nodes/revisions/timeline）随时在变；"定出去"是把某一时刻的整树
+// 冻结成 publications 里一行不可变快照。对外观看者永远只读到当前最新那行，
+// 与工作稿之后怎么改完全解耦。
+//
+// 并发安全靠 CAS：定稿请求必须带它看到的当前定稿序号 basePubSeq（首次为 0）。
+// 事务内比对，不一致直接拒绝——两个几乎同时点「定稿」的人里只有一个成功，
+// 另一个拿到 stale，看到新定稿后重新确认，不可能"两边都定出去了却对不上"。
+
+function normalizePublication(row) {
+  if (!row) return null;
+  let snapshot;
+  try {
+    snapshot = JSON.parse(row.snapshot);
+  } catch {
+    snapshot = { nodes: [] };
+  }
+  return {
+    id: row.id,
+    docId: row.doc_id,
+    pubSeq: row.pub_seq,
+    baseSeq: row.base_seq,
+    timelineSeq: row.timeline_seq,
+    title: row.title,
+    nodes: Array.isArray(snapshot.nodes) ? snapshot.nodes : [],
+    authorId: row.author_id,
+    author: row.author,
+    createdAt: row.created_at,
+  };
+}
+
+function getPublicationRow(db, docId, pubSeq) {
+  return db
+    .prepare('SELECT * FROM publications WHERE doc_id = ? AND pub_seq = ?')
+    .get(docId, pubSeq);
+}
+
+function getCurrentPublication(db, docId) {
+  const row = db
+    .prepare('SELECT * FROM publications WHERE doc_id = ? ORDER BY pub_seq DESC LIMIT 1')
+    .get(docId);
+  return normalizePublication(row);
+}
+
+function listPublications(db, docId, limit = 100) {
+  return db
+    .prepare('SELECT * FROM publications WHERE doc_id = ? ORDER BY pub_seq DESC LIMIT ?')
+    .all(docId, limit)
+    .map(normalizePublication);
+}
+
+// 把发布时刻的整树冻结成对外自包含的行：跟读行直接内嵌当时的投影正文，
+// 源文档以后怎么改（甚至删除）都不影响这份定稿。
+function freezeSnapshot(db, docId, tlSeq) {
+  const snap = getSnapshotAt(db, docId, tlSeq);
+  return snap.nodes.map((n) => {
+    const row = { id: n.id, parentId: n.parentId, pos: n.pos, kind: n.kind };
+    if (n.kind === 'mirror') {
+      row.mirrorOf = n.mirrorOf;
+      row.sourceDocId = n.sourceDocId || null;
+      row.sourceDeleted = n.sourceDeleted ? 1 : 0;
+    }
+    if (typeof n.content === 'string') {
+      row.content = n.content;
+      row.version = n.version;
+      row.author = n.author || '';
+    }
+    return row;
+  });
+}
+
+function sameFrozenNodes(a, b) {
+  if (a.length !== b.length) return false;
+  return a.every((n, i) => {
+    const m = b[i];
+    return n.id === m.id && n.parentId === m.parentId && n.pos === m.pos &&
+      n.kind === m.kind && (n.content || '') === (m.content || '') &&
+      (n.sourceDeleted || 0) === (m.sourceDeleted || 0);
+  });
+}
+
+// 返回 { status: 'published'|'unchanged'|'stale'|'missing', publication? }
+function publishDoc(db, { docId, basePubSeq, userId, userName }) {
+  return db.transaction(() => {
+    const doc = getDoc(db, docId);
+    if (!doc) return { status: 'missing' };
+    const currentRow = db
+      .prepare('SELECT * FROM publications WHERE doc_id = ? ORDER BY pub_seq DESC LIMIT 1')
+      .get(docId);
+    const currentSeq = currentRow ? currentRow.pub_seq : 0;
+    if (!Number.isInteger(basePubSeq) || basePubSeq < 0 || basePubSeq !== currentSeq) {
+      return { status: 'stale', current: normalizePublication(currentRow) };
+    }
+
+    const tlSeq = latestSeq(db);
+    const nodes = freezeSnapshot(db, docId, tlSeq);
+
+    // 内容与上一版定稿逐字相同：不新增版本，两边都收敛到同一版
+    if (currentRow) {
+      let prev;
+      try { prev = JSON.parse(currentRow.snapshot); } catch { prev = { nodes: [] }; }
+      if (sameFrozenNodes(prev.nodes || [], nodes) && currentRow.title === doc.title) {
+        return { status: 'unchanged', publication: normalizePublication(currentRow) };
+      }
+    }
+
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `INSERT INTO publications
+           (doc_id, pub_seq, base_seq, timeline_seq, title, snapshot, author_id, author, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        docId, currentSeq + 1, currentSeq, tlSeq, doc.title,
+        JSON.stringify({ nodes }), userId, userName, now,
+      );
+    const row = db.prepare('SELECT * FROM publications WHERE id = ?').get(info.lastInsertRowid);
+    return { status: 'published', publication: normalizePublication(row) };
+  })();
+}
+
 module.exports = {
   DEFAULT_DOC,
   init,
@@ -844,4 +987,7 @@ module.exports = {
   latestSeq,
   getTimeline,
   getSnapshotAt,
+  getCurrentPublication,
+  listPublications,
+  publishDoc,
 };
