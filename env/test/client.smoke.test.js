@@ -284,6 +284,71 @@ async function main() {
     await sleep(200);
   }
 
+  // ---- 段落留言：写留言→行内卡片/徽章→收掉→已收态；取消反悔不发请求 ----
+  // 用一条还活着的顶层种子段（默认文档）
+  const commentNodeId = roots[1]?.dataset.nodeId || secondId;
+  if (commentNodeId) {
+    $$('.doc-tab-label')[0].click();
+    await sleep(250);
+    const cOuter = $(`.node-outer[data-node-id="${commentNodeId}"]`);
+    const openComment = () => [...cOuter.querySelectorAll(':scope > .node > .node-row .node-actions button')]
+      .find((b) => b.textContent.includes('留言'));
+    openComment().click();
+    await sleep(150);
+    assert(!$('#comment-mask').classList.contains('hidden'), '留言面板打开');
+    $('#comment-input').value = '冒烟留言：这里要不要补数据？';
+    $('#comment-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+    await sleep(400);
+    assert(cOuter.textContent.includes('冒烟留言：这里要不要补数据？'), '广播回来后行内出现留言卡片');
+    assert(cOuter.textContent.includes('未收留言'), '行上出现未收留言徽章');
+    assert(openComment().textContent.includes('1/1'), '操作条按钮带未收/总数计数');
+
+    // 另一个连接直接收掉这条（模拟"别人先收"），本界面必须收敛到同一份已收。
+    // 该连接在留言发出之后才进房间：从快照的 comments 里取这条 id（历史消息不会重放）。
+    await new Promise((resolve, reject) => {
+      const other = new WS(`ws://127.0.0.1:${PORT}/ws`);
+      let done = false;
+      other.on('open', () => other.send(JSON.stringify({ type: 'hello', userId: 'u-other-resolve', userName: '收留言的人' })));
+      other.on('error', reject);
+      other.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'snapshot' && !done && Array.isArray(msg.comments)) {
+          const target = msg.comments.find((c) => c.content?.startsWith('冒烟留言') && c.status === 'open');
+          if (target) {
+            done = true;
+            other.send(JSON.stringify({ type: 'comment_resolve', commentId: target.id, content: '已补数据' }));
+            setTimeout(() => { other.close(); resolve(); }, 500);
+          }
+        }
+      });
+    });
+    await sleep(400);
+    assert(cOuter.textContent.includes('已收（收留言的人）'), '本界面收到广播，显示同一份已收');
+    assert(cOuter.textContent.includes('收掉时说：已补数据'), '已收说法逐字一致');
+    assert(!cOuter.textContent.includes('未收留言'), '未收徽章消失');
+    assert(!$(`.node-outer[data-node-id="${commentNodeId}"] .comment-card:not(.resolved)`), '没有开着的留言卡');
+
+    // 再写一条：打开收留言确认窗又取消——留言必须保持开着
+    $('#comment-input').value = '第二条：待反悔';
+    $('#comment-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+    await sleep(400);
+    const resolveBtn = [...cOuter.querySelectorAll('.comment-card:not(.resolved) .comment-tools button')]
+      .find((b) => b.textContent.includes('收掉这条'));
+    assert(!!resolveBtn, '新开的留言上有「收掉这条」');
+    resolveBtn.click();
+    await sleep(150);
+    assert(!$('#comment-resolve-mask').classList.contains('hidden'), '收留言确认弹窗打开');
+    $('#cr-note').value = '打了字但反悔';
+    $('#comment-resolve-cancel').click();
+    await sleep(150);
+    assert($('#comment-resolve-mask').classList.contains('hidden'), '取消后弹窗关闭');
+    const stillOpen = $(`.node-outer[data-node-id="${commentNodeId}"] .comment-card:not(.resolved)`);
+    assert(!!stillOpen && stillOpen.textContent.includes('第二条：待反悔'), '反悔后留言仍是上一份开着的样子');
+    assert(!cOuter.textContent.includes('打了字但反悔'), '没点确认，说法没有任何泄露');
+    $('#comment-cancel').click();
+    await sleep(50);
+  }
+
   // ---- 关闭一个标签页（保留至少一个）----
   await sleep(100);
   const closeBtns = $$('.doc-tab-close');

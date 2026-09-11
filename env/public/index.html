@@ -177,6 +177,48 @@
     </form>
   </div>
 
+  <!-- 段落留言弹窗：写留言；所有人以服务器广播为准 -->
+  <div id="comment-mask" class="conflict-mask hidden">
+    <div class="newdoc-card comment-panel-card">
+      <h3 id="comment-panel-title">这段的留言</h3>
+      <p class="muted">
+        留言挂在<b>段落</b>上，不挂在某一版正文上：这段以后怎么改字，留言都在。
+        发出后所有正在看这份大纲的人立刻看到同一条，不只是你自己的屏幕。
+      </p>
+      <div id="comment-panel-list" class="comment-panel-list"></div>
+      <form id="comment-form" class="comment-form">
+        <textarea id="comment-input" rows="3" maxlength="10000" placeholder="写一句留言…（Enter 发送，Shift+Enter 换行）" required></textarea>
+        <div class="conflict-actions">
+          <button type="button" id="comment-cancel" class="ghost">关闭</button>
+          <button type="submit" class="primary">发出留言</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 收留言确认弹窗：不点确认绝不发 comment_resolve，反悔零成本 -->
+  <div id="comment-resolve-mask" class="conflict-mask hidden">
+    <div class="newdoc-card">
+      <h3>收掉这条留言？</h3>
+      <p class="muted">
+        收掉后所有正在看这份大纲的人看到<b>同一份已收</b>（连同你写的说法）。
+        若你确认期间已被别人先收掉，这里会自动关掉并显示<b>先收者那份内容</b>——
+        不会两边都显示已收、说法却对不上。取消或关掉窗口什么都不会发生，留言仍保持开着。
+      </p>
+      <label class="final-label" id="comment-resolve-quote">
+        <span id="cr-author">留言</span>
+        <textarea id="cr-content" rows="4" readonly></textarea>
+      </label>
+      <label class="final-label">收掉时说一句（可留空）
+        <textarea id="cr-note" rows="2" maxlength="10000" placeholder="例如：已按此修改 / 已确认无需处理"></textarea>
+      </label>
+      <div class="conflict-actions">
+        <button type="button" id="comment-resolve-cancel" class="ghost">取消（留言保持开着）</button>
+        <button type="button" id="comment-resolve-btn" class="primary">确认收掉</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 定稿确认弹窗：不点确认绝不发 publish，反悔成本为零 -->
   <div id="publish-mask" class="conflict-mask hidden">
     <form id="publish-form" class="newdoc-card">

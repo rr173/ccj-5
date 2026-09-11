@@ -129,6 +129,28 @@ function init(dbFile) {
       UNIQUE(doc_id, pub_seq)
     );
     CREATE INDEX IF NOT EXISTS idx_publications_doc ON publications(doc_id, pub_seq);
+
+    -- 段落留言：锚定在「段落」（nodes.id，含跨文档跟读挂载行），不锚定正文版本——
+    -- 正文怎么改、改多少版，留言都原样挂在这段上（revisions 与 comments 互不相干）。
+    -- status 的 open/resolved 状态机就是并发收敛点：两条「收掉」在同一事务里串行，
+    -- UPDATE ... WHERE status='open' 只有一条会真正生效，后到者只拿到已收事实，
+    -- 全员广播同一条 comment_resolved，不可能"两边都显示收了、收的说法却对不上"。
+    CREATE TABLE IF NOT EXISTS comments (
+      id          TEXT PRIMARY KEY,
+      doc_id      TEXT NOT NULL,          -- 留言挂在哪个文档房间（决定广播范围）
+      node_id     TEXT NOT NULL,          -- 锚定的段落：普通行或跟读挂载行（各自独立）
+      content     TEXT NOT NULL,
+      author_id   TEXT NOT NULL,
+      author      TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'open',  -- open | resolved
+      resolved_content TEXT,              -- 收掉时的说法（resolved 后冻结，全员同一份）
+      resolved_by_id  TEXT,
+      resolved_by     TEXT,
+      created_at  INTEGER NOT NULL,
+      resolved_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_comments_doc ON comments(doc_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_comments_node ON comments(node_id, created_at);
   `);
 
   // 旧库迁移：补 mirror_of / excerpt_of 列（必须先于该列的索引创建）
@@ -1229,6 +1251,92 @@ function publishDoc(db, { docId, basePubSeq, userId, userName }) {
   })();
 }
 
+// ---------- 段落留言 ----------
+//
+// 留言锚定段落（nodes.id），与 revisions 完全独立：正文前进多少版本留言都在。
+// 留言不进 timeline（它是讨论，不是大纲内容/结构的演进；回看时刻只重建大纲本身）。
+// 收掉是一个 open -> resolved 的单行状态机，靠条件 UPDATE 做 CAS：
+// 两个几乎同时到达的「收掉」在同一 SQLite 事务队列里串行，只有第一个
+// WHERE status='open' 会改到行；后到者读到的已是 resolved（连同先到者的说法），
+// 调用方据此只广播先到者那一条 resolved——所有人收到的「已收内容」必然一致。
+
+function normalizeComment(r) {
+  if (!r) return null;
+  const out = {
+    id: r.id,
+    docId: r.doc_id,
+    nodeId: r.node_id,
+    content: r.content,
+    authorId: r.author_id,
+    author: r.author,
+    status: r.status,
+    createdAt: r.created_at,
+  };
+  if (r.status === 'resolved') {
+    out.resolvedContent = r.resolved_content;
+    out.resolvedBy = r.resolved_by;
+    out.resolvedById = r.resolved_by_id;
+    out.resolvedAt = r.resolved_at;
+  }
+  return out;
+}
+
+function listCommentsForDoc(db, docId) {
+  return db
+    .prepare('SELECT * FROM comments WHERE doc_id = ? ORDER BY created_at, rowid')
+    .all(docId)
+    .map(normalizeComment);
+}
+
+function getComment(db, commentId) {
+  const row = db.prepare('SELECT * FROM comments WHERE id = ?').get(commentId);
+  return normalizeComment(row);
+}
+
+function createComment(db, { id, docId, nodeId, content, userId, userName }) {
+  return db.transaction(() => {
+    const node = getNode(db, nodeId);
+    if (!node || node.deleted || node.excerpt_of) return { status: 'invalid_target' };
+    if (node.doc_id !== docId) return { status: 'wrong_doc' };
+    const now = Date.now();
+    db
+      .prepare(
+        `INSERT INTO comments (id, doc_id, node_id, content, author_id, author, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'open', ?)`,
+      )
+      .run(id, docId, nodeId, content, userId, userName, now);
+    return { status: 'created', comment: getComment(db, id) };
+  })();
+}
+
+// 收掉留言：条件 UPDATE 是 CAS。返回：
+//  resolved  —— 本次请求收掉的（调用方广播 comment_resolved，说法以返回值为准）
+//  already   —— 已被别人先收掉（带回先收那份；调用方只给后来者补发事实，绝不广播第二份）
+//  missing   —— 留言不存在
+function resolveComment(db, { commentId, content, userId, userName }) {
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM comments WHERE id = ?').get(commentId);
+    if (!row) return { status: 'missing' };
+    if (row.status === 'resolved') {
+      return { status: 'already', comment: normalizeComment(row) };
+    }
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `UPDATE comments
+           SET status = 'resolved', resolved_content = ?, resolved_by_id = ?,
+               resolved_by = ?, resolved_at = ?
+         WHERE id = ? AND status = 'open'`,
+      )
+      .run(content, userId, userName, now, commentId);
+    if (info.changes === 0) {
+      // 竞态兜底：事务排队期间被另一条抢先收掉
+      return { status: 'already', comment: getComment(db, commentId) };
+    }
+    return { status: 'resolved', comment: getComment(db, commentId) };
+  })();
+}
+
 module.exports = {
   DEFAULT_DOC,
   init,
@@ -1263,4 +1371,8 @@ module.exports = {
   getCurrentPublication,
   listPublications,
   publishDoc,
+  listCommentsForDoc,
+  getComment,
+  createComment,
+  resolveComment,
 };

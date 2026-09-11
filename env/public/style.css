@@ -322,6 +322,72 @@ button.danger-text { color: var(--danger); }
   padding: 8px 10px; resize: vertical; min-height: 180px;
 }
 
+/* 段落留言 */
+.comment-list {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 0 12px 8px;
+}
+.comment-card {
+  border: 1px solid #b9c8f7;
+  background: #f7f9ff;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.comment-card.mine { border-color: #8ba6f8; background: #f1f5ff; }
+.comment-card.resolved {
+  border-color: #b7d9c6; background: #f6fbf8;
+}
+.comment-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; font-size: 13px; margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.comment-text {
+  white-space: pre-wrap; word-break: break-word;
+  color: #263150; font-size: 14px;
+}
+.comment-card.resolved .comment-text { color: #4b5563; }
+.comment-resolved-note {
+  margin-top: 6px; font-size: 12px;
+  color: #166534; background: #eaf7f0;
+  border-radius: 6px; padding: 5px 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.comment-tools {
+  display: flex; justify-content: flex-end; gap: 6px;
+  margin-top: 6px;
+}
+.comment-tools button { padding: 2px 9px; font-size: 12px; }
+.comment-state.resolved-tag {
+  font-size: 11px; color: #166534; background: #e3f4ea;
+  border-radius: 999px; padding: 1px 10px; white-space: nowrap;
+}
+.comment-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; border-radius: 999px; padding: 1px 10px; cursor: pointer;
+}
+.comment-badge.open {
+  color: #1d4ed8; background: #e8effd; border: 1px solid #c9dbfa;
+}
+.comment-badge.open:hover { background: #d8e6fc; }
+
+/* 留言弹窗 */
+.comment-panel-card { width: 560px; }
+.comment-panel-list {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 46vh; overflow-y: auto;
+}
+.comment-panel-list .comment-empty { padding: 8px 2px; }
+.comment-panel-list .comment-list { padding: 0; }
+.comment-form { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.comment-form textarea {
+  font: inherit; line-height: 1.6;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; resize: vertical; width: 100%;
+}
+.comment-form textarea:focus { outline: 2px solid #b7cdf7; border-color: var(--accent); }
+#comment-resolve-btn.busy { opacity: .6; pointer-events: none; }
+
 .node-edit textarea {
   width: 100%; font: inherit; line-height: 1.6;
   border: 1px solid var(--border); border-radius: 8px;

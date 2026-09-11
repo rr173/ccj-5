@@ -13,6 +13,7 @@
 | 对外定稿 | 工作稿（编辑们实时协同这份）与**对外定稿**（不可变快照）严格分开：外面的人打开 `/published/` 只读页，只看最近一次「定稿」冻结下来的整树内容，工作稿怎么改都不外泄；再点一次定稿，发布在**单个事务**里原子切换并向所有观看者推送同一份新快照；并发定稿靠 `basePubSeq` 乐观锁——两人同时定，只有一个成功，另一个收到 `publish_stale` 重确认，不存在"两边都定出去了却对不上"；没点确认绝不产生新版本，反悔零成本，外面始终停在上一版 |
 | 一人讲解、全员同段 | 每份大纲的讲解轮次是服务器内存里的**单一事实源**：同一时刻最多一个讲解者，所有跟读端按同一条 `presentation` 消息锁定并滚动到所指标题；并发开讲只有一人成功，另一人收到 `presentation_denied`。交棒是两阶段 offer：接受前讲解者和位置都不变，讲解者可随时取消，大家仍停在上一轮指着的地方；接受后原子切换 leader，全员再跟新人走同一段 |
 | 把一段话抄一份挂到别处（**摘录**） | 摘录是**冻结副本**：做摘录那一刻把源段正文连同源版本号复制进自己的 `excerpt_states`，源之后怎么改，摘录的字纹丝不动；源每保存一版，所有挂着这段摘录的人立刻收到一条**不带正文**的版本标记，徽章马上从「与原文一致」翻成「原文已改到 v几」（不必重新打开），**绝不会悄悄换成新字**。更新只能靠显式「对齐到原文」：对齐在**单个事务**里冻结新正文，全员收到同一条 `excerpt_aligned`（所有人看到同一份）；并发对齐靠 `baseSourceVersion` 乐观锁——两人几乎同时对齐、各自认定的原文还对不上时，只有基于"源当前版本"的请求成功，另一个收到 `excerpt_align_stale` 并带回此刻真正的原文，重确认后才能成功，不存在"两边都提示成功却冻着不同的字"。不点确认绝不发请求，取消/关弹窗零成本，摘录始终停在上一版冻字 |
+| 在一段上留言 | 留言存在服务器、锚定**段落本身**（`nodeId`，跟读挂载行各自独立），与正文版本完全脱钩：这段后来改字、三方合并怎么走，留言都原样挂着。新增/收掉都广播给整个文档房间，**所有正在看这份的人（含自己的其他标签页）以同一条消息为唯一事实**，不做本地乐观显示。收掉是 open→resolved 的**单事务 CAS**（条件 `UPDATE … WHERE status='open'`）：两人几乎同时用不同说法收同一条，只有先到者写入并广播一条 `comment_resolved`，后到者收到 `comment_resolve_stale` 与先收那份说法并收敛过去，不会两边都显示已收、内容却对不上。收留言有确认弹窗，**没点确认绝不发请求**，取消/关窗零成本，留言在所有人那里保持上一份开着的样子 |
 | Docker 部署 | 单镜像 + 一个命名卷，`docker compose up -d` |
 
 > 锁只是**协作提示**，不参与正确性。即使绕过锁（或锁刚好过期时两人同时提交），
@@ -57,9 +58,10 @@ npm start                 # http://localhost:3000，SQLite 在 ./data/app.db
 ### 测试
 
 ```bash
-npm test                  # WebSocket 端到端（16 + 6 + 11 + 11 + 7 + 9 + 10 个场景）+ 离线续改端到端 + 单元测试
+npm test                  # WebSocket 端到端（16 + 6 + 11 + 11 + 8 + 7 + 9 + 10 个场景）+ 离线续改端到端 + 单元测试
 node test/offline.e2e.test.js             # 离线续改：真实客户端 + 服务器停启 + 重连对齐全流程
 node test/excerpt.e2e.test.js             # 摘录：冻结/源改不跟随/陈旧徽章/对齐广播一致/CAS 并发/源删除墓碑/时间轴
+node test/comments.e2e.test.js            # 段落留言：全员可见/改字不丢/收掉广播一致/并发 CAS 收敛/取消反悔/边界
 node test/presentation.e2e.test.js        # 讲解轮次：唯一讲解者/抢轮/两阶段交棒/取消反悔/断线结束
 node test/published.e2e.test.js           # 对外定稿：隔离/冻结/原子切换/并发 CAS/只读边界/跟读冻结
 node test/client.smoke.test.js            # jsdom 客户端冒烟：多文档 + 跟读全流程
@@ -120,6 +122,14 @@ clientTag 回执对号、未保存草稿落盘）。
   - 取消、点遮罩关闭、甚至点了之后反悔：只要没点「确认对齐」，就不会发任何请求，摘录始终是上一版冻着的字。
   - 源段落被删除：摘录**保留最后一次冻结的正文**（那是摘那一刻真实存在的字），但标注「源段落已删除」、不能再对齐；移除摘录只删这份副本，源和别处的摘录都不受影响。
   - 摘录只读：不能直接编辑、加锁、提改写、在其下加子级（要改用「去源大纲」），也不能再被摘录。做摘录与每次对齐都进时间轴，整份回看时摘录展示它在那个时刻冻住的字。
+- **段落留言**：段落悬浮操作里点「💬 留言」打开这段的留言面板（Enter 发送、Shift+Enter 换行）。
+  - 留言挂在**段落**上而不是某一版正文上：这段以后怎么改字，留言都在，不会跟着正文一起没。
+  - 发出后所有正在看这份大纲的人立刻看到同一条（你自己的其他标签页也以广播为准），行上挂「💬 N 条未收留言」徽章。
+  - 点留言卡片上的「收掉这条」会先弹确认窗，可附一句"收掉时说"（可留空）；确认后全员看到**同一份已收**。
+    你确认期间已被别人先收掉，弹窗自动关闭并显示**先收者那份说法**，绝不会两边都收了、内容却对不上。
+    取消或关掉弹窗什么都不会发生，留言仍是上一份开着的样子。
+  - 跟读行上的留言挂在这一处挂载行上（跨文档各自独立）；摘录是冻结副本，不能在上面留言（可去源段落）。
+    离线时不能留言（入口会提示联网），避免"自己屏幕显示发了、其实谁都没收到"。
 - **对外定稿**：顶栏「📢 定稿」把**当前工作稿**冻结成对外版本（确认弹窗里可勾选"定稿后打开对外页"）。  - 外面的人打开 `http://<站点>/published/?doc=<文档id>`（默认文档可省略参数），是**纯只读页**：
     没有登录、没有任何编辑入口；服务器把这种连接标记为 `viewer`，只推送定稿快照，
     工作稿的正文、结构、锁、改写提议一律不扇出，viewer 发来的写消息也被服务器直接拒绝。
@@ -148,6 +158,7 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
                       ├── revisions  (node_id, version 单调, content, author, note)
                       ├── excerpt_states (摘录的 append-only 冻结副本：content + source_version)
                       ├── timeline   (全局 seq 时刻：结构+内容事件，含 excerpt_add/excerpt_align，整树可重建)
+                      ├── comments   (段落留言：锚定 node_id 的 open/resolved 状态机，收掉靠条件 UPDATE CAS)
                       └── publications (pub_seq 定稿版本, base_seq CAS, timeline_seq, snapshot 冻结 JSON)
 ```
 
@@ -196,6 +207,30 @@ Express + ws (server/index.js) ── LockManager（内存：软锁/TTL/presence
 - **显式动作、反悔零成本**：打开/关闭确认弹窗都不产生任何写入；只有确认才发请求。
 - **源被删**：摘录保留最后冻字但收到 `excerpt_source_deleted` 立墓碑，再对齐收到
   `excerpt_align_gone`。移除摘录只是软删这一个引用行，源和别处引用都不受影响。
+
+### 段落留言协议要点
+
+- **锚定段落、不锚定版本**：留言外键是 `node_id`（普通行或跟读挂载行），与 `revisions`
+  没有任何耦合；正文保存、三方合并、回退接着改都不碰留言，"这段后来改了字，留言还在"
+  是数据模型天然保证的，不是 UI 层保留。跟读挂载行上的讨论挂在挂载行自己身上，
+  跨文档各自独立；摘录行是冻结副本，服务器直接拒绝在上面留言。
+- **服务器唯一事实源、无乐观显示**：`comment_add` 落库后广播一条 `comment_added`
+  给整个文档房间（含发起者自己的所有标签页），界面只以广播为准插入卡片——
+  不可能"只有自己屏幕上有"。晚加入/重连者从 `snapshot.comments` 拿整份。
+- **收掉是单行状态机 CAS**：`comments.status` open→resolved，SQL 是
+  `UPDATE … SET status='resolved', resolved_content=? WHERE id=? AND status='open'`。
+  Node 单线程顺序处理消息 + SQLite 事务，两条几乎同时到达、说法不同的收掉请求天然串行：
+  先到者 `changes=1`，广播**唯一一条** `comment_resolved`（全房间逐字一致，
+  resolvedContent 就此冻结）；后到者 `changes=0`，只收到个人回执
+  `comment_resolve_stale`（带回先收者那份），**绝不广播第二份 resolved**——
+  不存在"两边都显示已经收掉，内容却对不上"。
+- **显式动作、反悔零成本**：打开收留言确认弹窗、在里面打字都不产生请求；
+  只有点「确认收掉」才发 `comment_resolve`。取消/点遮罩关闭，留言在所有人那里
+  仍是上一份开着的样子。已收留言不提供"重开"（收掉是终态），但卡片与说法留痕。
+- **留言是讨论，不是大纲内容**：不进 `timeline`（时刻回看只重建大纲本身）、
+  不进对外定稿快照（viewer 连接不能留言，也收不到）；段落被删除时随行一起从视图消失。
+- **离线不能留言**：讨论类数据没有"本地队列/合并"管线，离线时留言入口直接拦下并提示
+  联网后再试，避免出现"我这边显示发了、其实谁都没收到"的假状态。
 
 ### 讲解轮次协议要点
 
@@ -258,6 +293,8 @@ delete {nodeId, treeRev}
 add_mirror {sourceId, docId, parentId, afterId, treeRev}   # 挂跟读：正文永远投影源
 add_excerpt {sourceId, docId, parentId, afterId, treeRev}  # 做摘录：冻一份源此刻的正文
 excerpt_align {nodeId, baseSourceVersion}                  # 把摘录对齐到原文此刻（CAS）
+comment_add {nodeId, commentId, content}                   # 段落留言：落服务器后全员广播
+comment_resolve {commentId, content}                       # 收掉留言（CAS：先到者说法为准；确认后才发）
 ```
 
 `clientTag` 是离线回放队列给保存贴的回执标签（可省）；
@@ -267,7 +304,7 @@ excerpt_align {nodeId, baseSourceVersion}                  # 把摘录对齐到�
 
 ```
 hello {user}
-snapshot {docId, title, treeRev, nodes[], locks[], presentation|null, users[], published?}
+snapshot {docId, title, treeRev, nodes[], locks[], presentation|null, users[], suggestions[], comments[], published?}
 presentation {docId, active, leader, nodeId, offer|null}   # 讲解轮次变化（active=false=本轮结束）
 presentation_denied {docId, leader, nodeId, message}
 published_state {docId, pubSeq, title, nodes|null, by?, createdAt?}  # 观看者初始；nodes=null=从未定稿
@@ -295,6 +332,9 @@ excerpt_align_ack {nodeId, sourceVersion, unchanged?}    # 只回发起者：解
 excerpt_align_stale {nodeId, current{version,content,...}, frozen, message}  # 并发输了：看新原文重确认，冻字不变
 excerpt_align_gone {nodeId, message}                     # 源已删除：无法对齐，冻字保留
 excerpt_source_deleted {sourceIds[]}                     # 源被删：摘录保留冻字、立墓碑
+comment_added {comment}                                  # 新留言（全房间同一条；comment 含 id/nodeId/content/author/status...）
+comment_resolved {comment}                               # 留言被收掉：全员同一份已收（含 resolvedContent/resolvedBy/resolvedAt）
+comment_resolve_stale {comment, message}                 # 并发收掉输了：只回后来者，带回先收那份，不再广播
 node_moved {nodeId, parentId, pos, treeRev}
 nodes_deleted {ids[], treeRev}
 tree_stale {treeRev}（后随 snapshot）

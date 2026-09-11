@@ -228,6 +228,7 @@ function snapshotMessage(docId) {
         }
       : null,
     suggestions: relevantSuggestions(snap.nodes),
+    comments: store.listCommentsForDoc(db, docId),
     users: presenceList(docId),
     published: pub
       ? {
@@ -1096,6 +1097,94 @@ function handleHistory(peer, msg) {
   send(peer, { type: 'history', nodeId, items });
 }
 
+// ---------- 段落留言：服务器是唯一事实源；收掉是 open->resolved 的 CAS ----------
+//
+// 关键语义（与定稿/摘录对齐同一套收敛思路）：
+// - 留言写在服务器、广播给整个文档房间：所有正在看这份的人立刻看到同一条，
+//   不存在"只在自己屏幕上"。留言锚定 nodeId（段落），与正文版本无关，
+//   正文怎么改都不删留言（快照里始终随段附带）。
+// - 收掉（resolve）在单个 SQLite 事务里做条件 UPDATE（WHERE status='open'）：
+//   Node 单线程顺序处理消息，两人几乎同时收同一条，只有先到的真正写入，
+//   后到者收到 already + 先收者的说法；房间里只广播一条 comment_resolved，
+//   所有端（含发起者的其他标签页）收到的"已收内容"逐字一致。
+// - 只有显式点「确认收掉」才发请求；打开确认弹窗/取消/点遮罩不产生任何写入，
+//   留言在所有人那里都还是上一份"开着"的样子。
+// - 跟读挂载行上的留言挂在挂载行本身（跨文档各自独立）；摘录行是冻结副本，不能留言。
+
+function handleCommentAdd(peer, msg) {
+  if (peer.role === 'viewer') {
+    send(peer, { type: 'error', message: '对外定稿页是只读的' });
+    return;
+  }
+  const nodeId = String(msg.nodeId || '');
+  const row = store.getNode(db, nodeId);
+  if (!row || row.deleted) {
+    send(peer, { type: 'error', nodeId, message: '该段落已被删除，不能留言' });
+    return;
+  }
+  if (row.excerpt_of) {
+    send(peer, { type: 'error', nodeId, message: '摘录是冻结副本，不能在上面留言；可去源段落留言' });
+    return;
+  }
+  if (!denyWriteWhileFollowing(peer, row.doc_id, { nodeId })) return;
+  const content = String(msg.content ?? '').trim().slice(0, 10_000);
+  if (!content) {
+    send(peer, { type: 'error', nodeId, message: '留言内容不能为空' });
+    return;
+  }
+  // 客户端预生成 id：广播与未来的回执可用同一个 id 对号，无需临时 id 映射
+  const id = String(msg.commentId || crypto.randomUUID());
+  const result = store.createComment(db, {
+    id,
+    docId: row.doc_id,
+    nodeId,
+    content,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status !== 'created') {
+    send(peer, { type: 'error', nodeId, message: '留言失败：段落不存在或不可留言' });
+    return;
+  }
+  // 全员（含发起者的其他标签页）同一条事实；发起者本连接也以广播为准
+  sendToDoc(row.doc_id, { type: 'comment_added', comment: result.comment });
+}
+
+function handleCommentResolve(peer, msg) {
+  if (peer.role === 'viewer') {
+    send(peer, { type: 'error', message: '对外定稿页是只读的' });
+    return;
+  }
+  const commentId = String(msg.commentId || '');
+  const existing = store.getComment(db, commentId);
+  if (existing && !denyWriteWhileFollowing(peer, existing.docId, { nodeId: existing.nodeId })) return;
+  // 收掉的说法可为空（一句话都不补也算收掉），但仍走同一个确认弹窗/CAS
+  const content = String(msg.content ?? '').trim().slice(0, 10_000);
+  const result = store.resolveComment(db, {
+    commentId,
+    content,
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', message: '留言不存在或已被删除' });
+    return;
+  }
+  if (result.status === 'already') {
+    // 并发输了：绝不广播第二份 resolved。把先收者那份事实带给后来者，
+    // 他的界面收敛到全员同一份（说法以先收者为准，不以他输入的为准）。
+    send(peer, {
+      type: 'comment_resolve_stale',
+      comment: result.comment,
+      message: `这条刚被 ${result.comment.resolvedBy || '另一位成员'} 收掉了，已为你显示同一份已收内容`,
+    });
+    return;
+  }
+  // resolved：全员（含发起者的其他标签页）收到同一条；不另发个人 ack，
+  // 保证"已收"只有一份事实来源。
+  sendToDoc(result.comment.docId, { type: 'comment_resolved', comment: result.comment });
+}
+
 // ---------- 整份时间轴：按时刻回看整棵树的层级与正文 ----------
 
 function handleTimeline(peer) {
@@ -1640,6 +1729,8 @@ wss.on('connection', (ws) => {
         case 'restore_save': handleRestoreSave(peer, msg); break;
         case 'resolve': handleResolve(peer, msg); break;
         case 'history': handleHistory(peer, msg); break;
+        case 'comment_add': handleCommentAdd(peer, msg); break;
+        case 'comment_resolve': handleCommentResolve(peer, msg); break;
         case 'timeline': handleTimeline(peer, msg); break;
         case 'snapshot_at': handleSnapshotAt(peer, msg); break;
         case 'add': handleAdd(peer, msg); break;

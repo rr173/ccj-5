@@ -378,6 +378,7 @@ const state = {
   activeDocId: null,
   usersByDoc: new Map(), // docId -> Map(userId -> user)
   proposals: new Map(),  // sourceId -> Map(suggestionId -> suggestion)
+  commentsByDoc: new Map(), // docId -> Map(commentId -> comment)
   historyNodeId: null,
   pendingFocus: null,    // { docId, nodeId, edit?:bool }，快照到达后滚动/进入编辑
   pendingNewDocId: null, // create_doc 后等待快照自动打开的文档
@@ -530,6 +531,55 @@ function removeProposals(sourceId, suggestionIds = []) {
   const map = state.proposals.get(sourceId);
   for (const id of suggestionIds) changed = (map?.delete(id) || false) || changed;
   if (changed) patchSource(sourceId);
+}
+
+/* ================= 段落留言 =================
+ *
+ * 留言锚定段落（nodeId，跟读挂载行各自独立），与正文版本完全无关：
+ * 正文怎么改、合并/冲突怎么走，留言都原样挂着。唯一事实源是服务器：
+ * - 新增/收掉都以房间广播为准（含自己的其他标签页），不做本地乐观落库；
+ * - 收掉是 open->resolved 的 CAS，两人几乎同时收，只有先到服务器的说法生效，
+ *   后到者收到 comment_resolve_stale 并收敛到同一份已收内容；
+ * - 没收掉就反悔：确认弹窗不点确认绝不发请求，留言在所有人那里保持开着。
+ * 留言不进离线队列（讨论类数据，离线时入口直接拦住并提示联网）。
+ */
+function commentMap(docId) {
+  if (!state.commentsByDoc.has(docId)) state.commentsByDoc.set(docId, new Map());
+  return state.commentsByDoc.get(docId);
+}
+
+function commentsForNode(docId, nodeId) {
+  const map = state.commentsByDoc.get(docId);
+  if (!map) return [];
+  return [...map.values()]
+    .filter((c) => c.nodeId === nodeId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function commentCounts(docId) {
+  const open = new Map();
+  const resolved = new Map();
+  for (const c of (state.commentsByDoc.get(docId)?.values() || [])) {
+    const bucket = c.status === 'resolved' ? resolved : open;
+    bucket.set(c.nodeId, (bucket.get(c.nodeId) || 0) + 1);
+  }
+  return { open, resolved };
+}
+
+function upsertComment(comment) {
+  if (!comment || !comment.docId || !comment.nodeId) return;
+  commentMap(comment.docId).set(comment.id, comment);
+  patchNodeById(comment.docId, comment.nodeId);
+  // 留言面板正开在这段上：列表/计数同步（别人刚留言或刚收掉，面板也实时一致）
+  if (commentPanel.nodeId === comment.nodeId && commentPanel.docId === comment.docId &&
+      !$('#comment-mask').classList.contains('hidden')) {
+    fillCommentPanel();
+  }
+}
+
+function patchNodeById(docId, nodeId) {
+  const view = viewOf(docId);
+  if (view) patchRow(view, nodeId);
 }
 
 function mustFollowPresentation() {
@@ -869,6 +919,22 @@ function handleMessage(msg) {
     case 'history':
       renderHistory(msg);
       break;
+    case 'comment_added':
+      upsertComment(msg.comment);
+      break;
+    case 'comment_resolved':
+      upsertComment(msg.comment);
+      // 正开着这条的收留言确认窗（别的标签页/另一个人先收了）：窗关掉，事实以广播为准
+      if (commentResolve.commentId === msg.comment.id) closeCommentResolveMask();
+      break;
+    case 'comment_resolve_stale': {
+      // 并发收掉输了：说法以先收者为准，界面收敛到同一份已收内容
+      $('#comment-resolve-btn')?.classList.remove('busy');
+      upsertComment(msg.comment);
+      closeCommentResolveMask();
+      toast(msg.message || '这条刚被别人收掉，已显示同一份已收内容', 'error', 4200);
+      break;
+    }
     case 'timeline':
       timelineCache.items = msg.items || [];
       timelineCache.latestSeq = msg.latestSeq || 0;
@@ -1141,6 +1207,8 @@ function ingestSnapshot(msg) {
     const list = (msg.suggestions || []).filter((s) => s.nodeId === sourceId);
     state.proposals.set(sourceId, new Map(list.map((s) => [s.id, s])));
   }
+  // 留言按文档整份随快照下发（讨论量小，一份文档一条房间消息即可）
+  state.commentsByDoc.set(docId, new Map((msg.comments || []).map((c) => [c.id, c])));
 
   if (state.pendingNewDocId === docId) {
     // 新建文档的第一份快照：自动打开为标签页
@@ -1319,11 +1387,14 @@ function applyDeleted(msg) {
   const view = viewOf(msg.docId);
   if (!view) return;
   view.treeRev = msg.treeRev;
+  const comments = state.commentsByDoc.get(msg.docId);
   for (const id of msg.ids) {
     view.nodes.delete(id);
     view.locks.delete(id);
     view.lockInfo?.delete(id);
     state.proposals.delete(id);
+    // 挂在被移除行上的留言也从本机视图摘掉（服务器行已软删，不会再下发）
+    if (comments) for (const [cid, c] of comments) if (c.nodeId === id) comments.delete(cid);
   }
   reindex(view);
   if (edit.sourceId && msg.ids.includes(edit.sourceId)) {
@@ -1860,6 +1931,7 @@ function renderNodeRow(view, node) {
         actionBtn('编辑', () => beginEdit(node.id)),
         actionBtn('提改写', () => openSuggestionComposer(node.id)),
         actionBtn('做摘录', () => createExcerpt(node.id)),
+        actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
         actionBtn('↗ 去源大纲编辑', () => jumpToSource(node, { edit: true })),
         actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       );
@@ -1897,6 +1969,7 @@ function renderNodeRow(view, node) {
       actionBtn('编辑', () => beginEdit(node.id)),
       actionBtn('提改写', () => openSuggestionComposer(node.id)),
       actionBtn('做摘录', () => createExcerpt(node.id)),
+      actionBtn(commentActionLabel(view, node.id), () => openCommentPanel(node.id)),
       actionBtn(presentActionLabel(node.id), () => presentNode(node.id)),
       actionBtn('＋子级', () => addNode(node.id, null)),
       actionBtn('＋ 同级', () => addNode(node.parentId, node.id)),
@@ -1910,6 +1983,12 @@ function renderNodeRow(view, node) {
   if (node.kind === 'node' || (node.kind === 'mirror' && !node.sourceDeleted)) {
     const proposals = proposalsForSource(sourceId);
     if (proposals.length) el.appendChild(renderSuggestionList(node, sourceId, proposals));
+  }
+
+  // 段落留言：锚定这一行（跟读挂载行与源行各自独立）；正文怎么改留言都在
+  if (node.kind !== 'excerpt') {
+    const comments = commentsForNode(view.id || state.activeDocId, node.id);
+    if (comments.length) el.appendChild(renderCommentList(node, comments));
   }
 
   // 元信息行
@@ -1998,9 +2077,24 @@ function renderNodeRow(view, node) {
     badge.textContent = amPresentationLeader() ? '📣 你正指着这里，大家跟随' : `📣 ${currentPresentation()?.leader.userName || '讲解者'} 正指着这里`;
     meta.appendChild(badge);
   }
+  // 留言计数：有未收留言时给一个可点的蓝色徽章（点开留言面板）；全收完只在悬浮操作条看数量
+  if (node.kind !== 'excerpt') {
+    const list = commentsForNode(view.id || state.activeDocId, node.id);
+    const openN = list.filter((c) => c.status !== 'resolved').length;
+    if (openN > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'comment-badge open';
+      badge.textContent = `💬 ${openN} 条未收留言`;
+      badge.title = '点开看留言并收掉；留言挂在段落上，正文改字不影响留言';
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openCommentPanel(node.id);
+      });
+      meta.appendChild(badge);
+    }
+  }
   // 离线改动状态：待同步（黄）/ 与线上冲突待裁决（红，明示当前以线上为准）
-  const pendingOp = pendingOpFor(sourceId);
-  if (pendingOp && !(node.kind === 'mirror' && node.sourceDeleted)) {
+  const pendingOp = pendingOpFor(sourceId);  if (pendingOp && !(node.kind === 'mirror' && node.sourceDeleted)) {
     const badge = document.createElement('span');
     if (pendingOp.status === 'conflict') {
       const cur = pendingOp.conflict?.current;
@@ -2069,6 +2163,229 @@ function actionBtn(label, onClick, danger = false) {
   });
   return b;
 }
+
+// 悬浮操作条上的留言按钮文案：把未收/已收数量带出来
+function commentActionLabel(view, nodeId) {
+  const list = commentsForNode(view.id || state.activeDocId, nodeId);
+  if (!list.length) return '💬 留言';
+  const openN = list.filter((c) => c.status !== 'resolved').length;
+  return openN ? `💬 留言 ${openN}/${list.length}` : `💬 留言 0/${list.length}`;
+}
+
+function renderCommentList(node, comments) {
+  const box = document.createElement('div');
+  box.className = 'comment-list';
+  for (const c of comments) {
+    const card = document.createElement('div');
+    card.className = 'comment-card' + (c.status === 'resolved' ? ' resolved' : '') +
+      (state.me && c.authorId === state.me.userId ? ' mine' : '');
+    card.dataset.commentId = c.id;
+
+    const head = document.createElement('div');
+    head.className = 'comment-head';
+    const who = document.createElement('span');
+    who.innerHTML =
+      `<span class="avatar small" style="background:${escapeHtml(colorOfUser(c.authorId))}">` +
+      `${escapeHtml(initials(c.author))}</span> ` +
+      `<strong>${escapeHtml(c.author || '匿名成员')}</strong> ` +
+      `<span class="muted">${fmtTime(c.createdAt)}</span>`;
+    head.appendChild(who);
+    if (c.status === 'resolved') {
+      const tag = document.createElement('span');
+      tag.className = 'comment-state resolved-tag';
+      tag.textContent = `✓ 已收（${c.resolvedBy || '成员'}）`;
+      head.appendChild(tag);
+    }
+    card.appendChild(head);
+
+    const text = document.createElement('div');
+    text.className = 'comment-text';
+    text.textContent = c.content || '（空内容）';
+    card.appendChild(text);
+
+    if (c.status === 'resolved') {
+      const resolveNote = document.createElement('div');
+      resolveNote.className = 'comment-resolved-note';
+      const lead = c.resolvedContent ? '收掉时说：' : '未附说法';
+      resolveNote.textContent = `✓ ${c.resolvedBy || '成员'} 收掉${c.resolvedAt ? ` · ${fmtTime(c.resolvedAt)}` : ''}：${lead}${c.resolvedContent || ''}`;
+      card.appendChild(resolveNote);
+    } else {
+      const tools = document.createElement('div');
+      tools.className = 'comment-tools';
+      tools.append(actionBtn('收掉这条', () => openCommentResolve(c)));
+      card.appendChild(tools);
+    }
+    box.appendChild(card);
+  }
+  return box;
+}
+
+// 头像颜色与服务端同一套哈希（进不来 user 列表的已离开成员也要有稳定颜色）
+const COMMENT_COLORS = [
+  '#e11d48', '#2563eb', '#059669', '#d97706', '#7c3aed',
+  '#0891b2', '#db2777', '#65a30d', '#ea580c', '#4f46e5',
+];
+function colorOfUser(userId) {
+  const known = (userId && [...(state.usersByDoc.values())]
+    .map((m) => m.get(userId))
+    .find(Boolean));
+  if (known?.color) return known.color;
+  let h = 0;
+  for (const ch of String(userId || '')) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return COMMENT_COLORS[h % COMMENT_COLORS.length];
+}
+
+/* ---------- 留言面板（行内展开）：写新留言 ---------- */
+
+const commentPanel = { nodeId: null, docId: null };
+
+function openCommentPanel(nodeId) {
+  if (!state.connected) {
+    toast('离线中：留言需要实时同步给所有人，请恢复连接后再留言（留言不进本机队列）', 'error', 4600);
+    return;
+  }
+  if (!requirePresenterForEdit()) return;
+  const found = findRow(nodeId);
+  if (!found) return;
+  if (found.node.kind === 'excerpt') {
+    toast('摘录是冻结副本，不能在上面留言；可去源段落留言', 'error');
+    return;
+  }
+  if (found.node.kind === 'mirror' && found.node.sourceDeleted) {
+    toast('跟读的源段落已删除，不能在这行留言', 'error');
+    return;
+  }
+  commentPanel.nodeId = nodeId;
+  commentPanel.docId = findViewDocOfNode(nodeId);
+  $('#comment-input').value = '';
+  fillCommentPanel();
+  $('#comment-mask').classList.remove('hidden');
+  $('#comment-input').focus();
+}
+
+function findViewDocOfNode(nodeId) {
+  for (const [docId, view] of state.views) if (view.nodes.has(nodeId)) return docId;
+  return state.activeDocId;
+}
+
+function closeCommentPanel() {
+  $('#comment-mask').classList.add('hidden');
+  commentPanel.nodeId = null;
+  commentPanel.docId = null;
+}
+
+function fillCommentPanel() {
+  const nodeId = commentPanel.nodeId;
+  const docId = commentPanel.docId;
+  const title = $('#comment-panel-title');
+  const found = findRow(nodeId);
+  title.textContent = found
+    ? `这段的留言：「${String(found.node.content || '空段落').replace(/\s+/g, ' ').slice(0, 40)}」`
+    : '这段的留言';
+  const list = $('#comment-panel-list');
+  list.innerHTML = '';
+  const comments = commentsForNode(docId, nodeId);
+  if (!comments.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted comment-empty';
+    empty.textContent = '还没有留言。写下第一条，所有正在看这份大纲的人会立刻看到；正文以后怎么改，留言都挂在这段上。';
+    list.appendChild(empty);
+  } else {
+    // 面板里复用同一套卡片渲染
+    list.appendChild(renderCommentList({ id: nodeId }, comments));
+  }
+}
+
+$('#comment-cancel').addEventListener('click', closeCommentPanel);
+$('#comment-mask').addEventListener('click', (e) => {
+  if (e.target === $('#comment-mask')) closeCommentPanel();
+});
+$('#comment-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const content = $('#comment-input').value.trim();
+  if (!content || !commentPanel.nodeId) return;
+  if (!state.connected) {
+    toast('离线中：留言要实时同步给所有人，请恢复连接后再发', 'error');
+    return;
+  }
+  const commentId = uid();
+  // 服务器广播 comment_added 是唯一事实（含自己的其他标签页）；发完清空输入，
+  // 广播回来后卡片自然出现，绝不只在本机乐观插一条。
+  send({
+    type: 'comment_add',
+    nodeId: commentPanel.nodeId,
+    commentId,
+    content,
+  });
+  $('#comment-input').value = '';
+  $('#comment-input').focus();
+  // 广播通常几十毫秒即回；稍等片刻刷新面板，让自己刚发的卡片出现
+  setTimeout(() => {
+    if (commentPanel.nodeId) fillCommentPanel();
+  }, 150);
+});
+$('#comment-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    $('#comment-form').requestSubmit();
+  }
+});
+
+/* ---------- 收掉留言：显式确认 + CAS，反悔零成本 ---------- */
+
+const commentResolve = { commentId: null, nodeId: null, docId: null, requestId: 0 };
+
+function openCommentResolve(comment) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  commentResolve.commentId = comment.id;
+  commentResolve.nodeId = comment.nodeId;
+  commentResolve.docId = comment.docId;
+  commentResolve.requestId++;
+  $('#cr-author').textContent = `${comment.author || '匿名成员'} 的留言`;
+  $('#cr-content').textContent = comment.content || '（空内容）';
+  $('#cr-note').value = '';
+  $('#comment-resolve-btn').classList.remove('busy');
+  $('#comment-resolve-mask').classList.remove('hidden');
+  $('#cr-note').focus();
+}
+
+function closeCommentResolveMask() {
+  $('#comment-resolve-mask').classList.add('hidden');
+  $('#comment-resolve-btn')?.classList.remove('busy');
+  commentResolve.commentId = null;
+  commentResolve.nodeId = null;
+  commentResolve.docId = null;
+  commentResolve.requestId++;
+}
+
+$('#comment-resolve-cancel').addEventListener('click', () => {
+  // 没收掉就反悔：不发任何请求，留言在所有人那里仍是上一份"开着"的样子
+  closeCommentResolveMask();
+});
+$('#comment-resolve-mask').addEventListener('click', (e) => {
+  if (e.target === $('#comment-resolve-mask')) closeCommentResolveMask();
+});
+$('#comment-resolve-btn').addEventListener('click', () => {
+  const commentId = commentResolve.commentId;
+  if (!commentId) return;
+  if (!requireOnline()) return;
+  const requestId = commentResolve.requestId;
+  $('#comment-resolve-btn').classList.add('busy');
+  // 只把"我在确认窗里看到、并明确确认收掉"的说法带上。服务器事务内条件更新：
+  // 这条仍是 open 才收掉并广播同一份；已被别人先收则回 stale，本地收敛到先收那份。
+  send({
+    type: 'comment_resolve',
+    commentId,
+    content: $('#cr-note').value.trim(),
+  });
+  // 兜底解除忙碌态（真正关窗等 comment_resolved / stale）
+  setTimeout(() => {
+    if (commentResolve.commentId === commentId && commentResolve.requestId === requestId) {
+      $('#comment-resolve-btn')?.classList.remove('busy');
+    }
+  }, 4000);
+});
 
 /* 局部补丁：源段落变了，把所有挂载点（源行 + 跟读行）的 DOM 换掉 */
 function patchSource(sourceId) {
