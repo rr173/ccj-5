@@ -1062,11 +1062,39 @@ function applyContent(msg, { silent = false, self = false } = {}) {
   }
   if (edit.sourceId === msg.nodeId) {
     edit.serverVersion = msg.version;
+    // 改写被收下是一次公开的正文定稿：即使我正开着编辑器，也必须立刻
+    // 换成同一份正文，不能让 textarea 里的未保存草稿继续盖在屏幕上。
+    if (msg.acceptedSuggestionId) adoptAcceptedContent(msg);
     patchSource(msg.nodeId);
   }
   if (!self && state.historyNodeId === msg.nodeId) {
     send({ type: 'history', nodeId: msg.nodeId });
   }
+}
+
+function adoptAcceptedContent(msg) {
+  // 如果编辑器里折着一段本机离线改动，收下定稿后也以公开正文为准，
+  // 避免它之后回放又把大家刚收下的内容顶掉。
+  const folded = pendingOpFor(msg.nodeId);
+  if (folded && folded.inEditor) removeOp(folded);
+  clearPersistedDraft(msg.nodeId);
+
+  edit.draft = msg.content;
+  edit.baseVersion = msg.version;
+  edit.restoreFromVersion = null;
+  edit.saving = false;
+
+  const ta = document.querySelector(
+    `.node[data-node-id="${cssEscape(edit.entryNodeId || msg.nodeId)}"] textarea`,
+  );
+  if (ta) {
+    ta.value = msg.content;
+    ta.disabled = false;
+    const len = ta.value.length;
+    ta.setSelectionRange(len, len);
+  }
+  patchEditorStatus();
+  toast(`一版改写已被收下，编辑器已同步为当前正文 v${msg.version}`, 'ok', 4200);
 }
 
 function applyMove(msg) {

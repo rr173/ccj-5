@@ -191,6 +191,51 @@ async function main() {
   assert(sourceAccepted.includes('【冒烟提议收下】'), '收下后源正文也是同一版');
   assert(!$(`.node-outer[data-node-id="${sourceNodeId}"] .suggestion-card`), '收下后源行改写卡片消失');
 
+  // 我仍开着编辑器打字时，别人收下另一版：当前 textarea 必须立即换成定稿
+  const editAgainBtn = [...$$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-actions button`)]
+    .find((b) => b.textContent === '编辑');
+  editAgainBtn.click();
+  await sleep(200);
+  const liveEditor = $('#outline textarea');
+  assert(!!liveEditor, '源段落再次进入编辑态');
+  liveEditor.value = liveEditor.value + '【我本机还在打的字】';
+  liveEditor.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+  await new Promise((resolve, reject) => {
+    const other = new WS(`ws://127.0.0.1:${PORT}/ws`);
+    let started = false;
+    let pendingText = '';
+    other.on('open', () => {
+      other.send(JSON.stringify({ type: 'hello', userId: 'u-other-proposal', userName: '旁边的人' }));
+    });
+    other.on('error', reject);
+    other.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'snapshot' && !started) {
+        started = true;
+        const node = msg.nodes.find((n) => n.id === sourceNodeId);
+        pendingText = node.content + '【旁边人收下的新版】';
+        other.send(JSON.stringify({
+          type: 'suggestion_add',
+          nodeId: sourceNodeId,
+          content: pendingText,
+          baseVersion: node.version,
+        }));
+      }
+      if (msg.type === 'suggestion_added' && msg.suggestion?.content === pendingText) {
+        other.send(JSON.stringify({ type: 'suggestion_accept', suggestionId: msg.suggestion.id }));
+        setTimeout(() => { other.close(); resolve(); }, 500);
+      }
+    });
+  });
+  await sleep(300);
+  const syncedEditor = $('#outline textarea');
+  assert(!!syncedEditor, '收下后编辑器保持打开，但内容已同步');
+  assert(syncedEditor.value.includes('【旁边人收下的新版】'), '编辑器里是刚收下的新版正文');
+  assert(!syncedEditor.value.includes('【我本机还在打的字】'), '未保存的本机输入不再盖住已收下的正文');
+  syncedEditor.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await sleep(200);
+
   // ---- 删除源段落 -> 跟读墓碑，不显示旧正文 ----
   const editBtn2 = [...$$(`.node-outer[data-node-id="${sourceNodeId}"] > .node .node-actions button`)]
     .find((b) => b.textContent === '编辑');
