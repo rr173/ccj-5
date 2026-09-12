@@ -1082,6 +1082,11 @@ function handleMessage(msg) {
     case 'restore_stale':
       onRestoreStale(msg);
       break;
+    case 'restore_waiting':
+      $('#restore-confirm-btn')?.classList.remove('busy');
+      if (restoreDialog.trashId === msg.trashId) closeRestoreMask();
+      toast(msg.message || '上级段落还没捞回：这批会随上级一起回来', 'ok', 5200);
+      break;
     case 'source_deleted':
       applySourceDeleted(msg);
       break;

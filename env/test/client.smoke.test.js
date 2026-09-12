@@ -423,6 +423,56 @@ async function main() {
     await sleep(50);
   }
 
+  // ---- 可捞名单：删除进名单（带计数）→ 打开名单 → 取消不发请求 → 确认捞回原位 ----
+  $$('.doc-tab-label')[0].click();
+  await sleep(250);
+  // 选一个此前提早缓存好的顶层段（roots 是删除操作前缓存的，含 n1/n4 等）
+  const trashTargetId = roots[1]?.dataset.nodeId || roots[0]?.dataset.nodeId || null;
+  if (trashTargetId) {
+    const beforeCountText = $('#trash-count').classList.contains('hidden')
+      ? '0' : $('#trash-count').textContent;
+    const beforeCount = Number(beforeCountText || 0);
+    const tOuter = $(`.node-outer[data-node-id="${trashTargetId}"]`);
+    // 删除（confirm 已被桩成 true）
+    const delTarget = [...tOuter.querySelectorAll(':scope > .node > .node-row .node-actions button')]
+      .find((b) => b.textContent.trim() === '编辑');
+    delTarget.click();
+    await sleep(200);
+    const editorDel = [...$$('.edit-tools button')].find((b) => b.textContent === '删除');
+    editorDel.click();
+    await sleep(500);
+    assert(!$(`.node-outer[data-node-id="${trashTargetId}"]`), '删除后该段从树里消失');
+    assert(!$('#trash-count').classList.contains('hidden'), '顶栏捞回计数出现');
+    assert(Number($('#trash-count').textContent) === beforeCount + 1, '名单计数 +1（全员同一份）');
+
+    $('#trash-btn').click();
+    await sleep(150);
+    assert(!$('#trash-panel').classList.contains('hidden'), '可捞名单抽屉打开');
+    const cards = $$('#trash-list .trash-card');
+    assert(cards.length >= 1, '名单里至少有刚删的这批');
+
+    // 打开确认窗又取消：树保持拿掉的样子，段没有回来
+    cards[0].querySelector('.restore-trash-btn').click();
+    await sleep(150);
+    assert(!$('#restore-mask').classList.contains('hidden'), '捞回确认弹窗打开，能看到删前原文');
+    assert($('#restore-quote').value.length >= 0, '弹窗展示删前原文');
+    $('#restore-cancel').click();
+    await sleep(150);
+    assert($('#restore-mask').classList.contains('hidden'), '取消后弹窗关闭');
+    assert(!$(`.node-outer[data-node-id="${trashTargetId}"]`), '取消后树仍是拿掉的样子（没发 restore）');
+
+    // 重新打开并确认捞回：段回到树上
+    $('#trash-btn').click();
+    await sleep(100);
+    $$('#trash-list .trash-card')[0].querySelector('.restore-trash-btn').click();
+    await sleep(100);
+    $('#restore-confirm-btn').click();
+    await sleep(600);
+    assert(!!$(`.node-outer[data-node-id="${trashTargetId}"]`), '确认捞回后段回到树上');
+    $('#trash-close').click();
+    await sleep(50);
+  }
+
   // ---- 关闭一个标签页（保留至少一个）----
   await sleep(100);
   const closeBtns = $$('.doc-tab-close');

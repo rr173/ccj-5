@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "npm run test:e2e && npm run test:suggestions && npm run test:mirror && npm run test:excerpt && npm run test:comments && npm run test:seals && npm run test:timetravel && npm run test:published && npm run test:presentation && npm run test:offline && npm run test:unit",
+    "test": "npm run test:e2e && npm run test:suggestions && npm run test:mirror && npm run test:excerpt && npm run test:comments && npm run test:seals && npm run test:timetravel && npm run test:published && npm run test:presentation && npm run test:trash && npm run test:offline && npm run test:unit",
     "test:e2e": "WS_PORT=3777 WS_PING_MS=300 DB_FILE=./data/test.db node test/e2e.test.js",
     "test:suggestions": "WS_PORT=3780 DB_FILE=./data/suggestions.db node test/suggestions.e2e.test.js",
     "test:mirror": "WS_PORT=3778 WS_PING_MS=300 DB_FILE=./data/mirror.db node test/mirror.e2e.test.js",
@@ -16,6 +16,7 @@
     "test:timetravel": "WS_PORT=3779 WS_PING_MS=300 DB_FILE=./data/timetravel.db node test/timetravel.e2e.test.js",
     "test:published": "WS_PORT=3781 DB_FILE=./data/published.db node test/published.e2e.test.js",
     "test:presentation": "WS_PORT=3782 DB_FILE=./data/presentation.db node test/presentation.e2e.test.js",
+    "test:trash": "WS_PORT=3786 DB_FILE=./data/trash.db node test/trash.e2e.test.js",
     "test:offline": "node test/offline.e2e.test.js",
     "test:unit": "node test/fraction.test.js && node test/merge.test.js && node test/merge.property.test.js"
   },

@@ -1901,6 +1901,20 @@ function handleRestoreNode(peer, msg) {
     send(peer, { type: 'error', message: '这条可捞记录不存在' });
     return;
   }
+  if (result.status === 'waiting') {
+    // 父级还在名单里没捞回：这批先记下"已确认捞回"（名单移除），等父级回来时
+    // 随父级批一起复活、同一条 nodes_restored 广播带回，现在树没有可见变化。
+    sendToDoc(batch.docId, { type: 'trash_update', docId: batch.docId, trash: store.listTrash(db, batch.docId, true) });
+    send(peer, {
+      type: 'restore_waiting',
+      docId: batch.docId,
+      trashId,
+      rootId: result.rootId,
+      parentId: result.parentId,
+      message: '它的上级段落还在可捞名单里：这批已记下要捞回，等上级被捞回时会和它一起回到原位',
+    });
+    return;
+  }
   if (result.status === 'stale_tree') {
     const doc = store.getDoc(db, batch.docId);
     sendStale(peer, doc);
@@ -1955,6 +1969,12 @@ function handleRestoreNode(peer, msg) {
     trash: store.listTrash(db, docId, true),
     by: { userId: peer.user.userId, userName: peer.user.userName },
   });
+
+  // 讲解轮次若指着刚捞回的某段：恢复有效，无需结束；位置变化时让全员重新跟随。
+  const p = getPresentation(docId);
+  if (p && result.ids.includes(p.nodeId)) {
+    broadcastPresentation(docId);
+  }
 
   // 跨文档的跟读/摘录：源回来了，墓碑撤除。跟读宿主顺便带上各源当前正文，
   // 它们重新投影；摘录只收"源回来了 + 当前版本"，冻字一个字都不自动换。

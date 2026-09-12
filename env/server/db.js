@@ -191,6 +191,7 @@ function init(dbFile) {
       preview     TEXT NOT NULL DEFAULT '', -- root 删前正文摘要（名单里展示用）
       count       INTEGER NOT NULL DEFAULT 1, -- 这批共多少段（含子树）
       active      INTEGER NOT NULL DEFAULT 1, -- 1=在名单里可捞；0=已捞回（留痕）
+      pending     INTEGER NOT NULL DEFAULT 0, -- 1=已确认捞回但父级仍在名单：节点保持 deleted，等父级回来一并复活
       author_id   TEXT NOT NULL DEFAULT '',
       author      TEXT NOT NULL DEFAULT '',
       created_at  INTEGER NOT NULL,
@@ -224,6 +225,12 @@ function init(dbFile) {
     db.exec('ALTER TABLE timeline ADD COLUMN excerpt_source_version INTEGER');
   }
 
+  // 可捞名单迁移：挂起批（父级还没捞回时先确认的子批）
+  const trashCols0 = db.prepare('PRAGMA table_info(trash_events)').all();
+  if (trashCols0.length && !trashCols0.some((c) => c.name === 'pending')) {
+    db.exec('ALTER TABLE trash_events ADD COLUMN pending INTEGER NOT NULL DEFAULT 0');
+  }
+
   backfillTimeline(db);
   backfillTrash(db);
   seedIfEmpty(db);
@@ -252,7 +259,7 @@ function backfillTrash(db) {
        (doc_id, root_id, ids, parent_id, pos, preview, count, active,
         author_id, author, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
-  );
+  ); // 11 列，run 传 10 个绑定值（active 固定为 1）
   const nodeStmt = db.prepare('SELECT * FROM nodes WHERE id = ?');
   const revStmt = db.prepare(
     'SELECT content FROM revisions WHERE node_id = ? ORDER BY version DESC LIMIT 1',
@@ -273,7 +280,7 @@ function backfillTrash(db) {
       const rev = revStmt.get(e.node_id);
       ins.run(
         e.doc_id, e.node_id, JSON.stringify(ids),
-        root.parent_id, root.pos, clip(rev ? rev.content : '', 80), ids.length,
+        root.parent_id ?? null, root.pos, clip(rev ? rev.content : '', 80), ids.length,
         e.author_id || '', e.author || '系统', e.created_at || now,
       );
     }
@@ -1682,6 +1689,7 @@ function normalizeTrashEvent(row) {
     preview: row.preview || '',
     count: row.count || 1,
     active: row.active ? 1 : 0,
+    pending: row.pending ? 1 : 0,
     authorId: row.author_id,
     author: row.author,
     createdAt: row.created_at,
@@ -1713,16 +1721,34 @@ function getTrashEvent(db, id) {
   return normalizeTrashEvent(row);
 }
 
-// 同层最后一个存活位置（顶层 parentId=null 用 IS NULL 匹配）
-function lastSiblingPos(db, docId, parentId) {
-  const row = db
+// 捞回定位：把旧位置 oldPos 放回它删前那两个邻居之间。
+// 直接写回 oldPos 在两种情况下会错：
+//  1) 顶层段落 parentId 本来就是 NULL，不能把"没有父级"误判成"父级没了"而追加到末尾；
+//  2) 删除期间别人可能恰好在同一间隙插入过新段，分数索引 midpoint 会生成与 oldPos
+//     完全相同的 pos（撞键），写回旧值顺序不再受保证。
+// 做法：取当前存活同级里夹着 oldPos 的前后两条（严格小于/大于），在二者之间取中点；
+// 若 oldPos 这个槽已被占用，就贴着占用者取内侧，仍然落回原邻居之间、且 pos 绝不撞键。
+function posBackBetween(db, docId, parentId, oldPos) {
+  const live = db
     .prepare(
       `SELECT pos FROM nodes
        WHERE doc_id = ? AND deleted = 0 AND parent_id IS ?
-       ORDER BY pos DESC LIMIT 1`,
+       ORDER BY pos`,
     )
-    .get(docId, parentId);
-  return row ? row.pos : null;
+    .all(docId, parentId)
+    .map((r) => r.pos);
+  let i = 0;
+  while (i < live.length && live[i] < oldPos) i++;
+  if (i < live.length && live[i] === oldPos) {
+    // 旧槽被占用：优先落在占用者与前邻居之间（仍是原来那段间隙），
+    // 前面没邻居就落在占用者与后邻居之间，都没有就追加在占用者之后。
+    if (i > 0) return midpoint(live[i - 1], oldPos);
+    if (i + 1 < live.length) return midpoint(oldPos, live[i + 1]);
+    return midpoint(oldPos, null);
+  }
+  const lo = i > 0 ? live[i - 1] : null;
+  const hi = i < live.length ? live[i] : null;
+  return midpoint(lo, hi);
 }
 
 // 捞回一批（整棵子树）。
@@ -1741,7 +1767,17 @@ function restoreTrash(db, { trashId, treeRev, userId = '', userName = '' }) {
       return { status: 'stale_tree', treeRev: doc.tree_rev };
     }
     if (!batch.active) {
-      // 并发输了：先捞者已把这批放回树上。带回先捞者的结果，界面收敛到同一份。
+      // 并发输了：先捞者已把这批放回树上（或已挂起等父级）。
+      if (batch.pending) {
+        return {
+          status: 'waiting',
+          ids: (() => { try { return JSON.parse(batch.ids || '[]'); } catch { return []; } })(),
+          rootId: batch.root_id,
+          parentId: batch.parent_id,
+          treeRev: doc.tree_rev,
+        };
+      }
+      // 已被别人先捞回：带回先捞者的结果，界面收敛到同一份。
       const root = getNode(db, batch.root_id);
       return {
         status: 'already',
@@ -1760,26 +1796,44 @@ function restoreTrash(db, { trashId, treeRev, userId = '', userName = '' }) {
         .map((n) => [n.id, n]),
     );
 
-    // root 删掉前的父级还在不在：还在就放回原位（整棵子树内部 parent/pos 不动，
-    // 自然呈现"拿掉前的位置和原文"）；父级当时也一起被删（子树删除不会发生），
-    // 或父级此刻在另一批名单里还没捞回，则放到顶层末尾——等父级那批之后被捞回，
-    // 子树仍按 parent 指针重新挂回它下面。
+    // root 删掉前的父级还在不在：
+    // - 本来就在顶层（parent_id 为 NULL）：父级没丢，要回到顶层原邻居之间；
+    // - 原父级还活着：回到该父级下的原邻居之间；
+    // - 原父级此刻也在删除状态（另一批还没捞回）：这批先在数据上"挂起"——
+    //   批次标为已捞回（名单移除），但节点仍保持 deleted，等父级那批回来时由它
+    //   一并复活；这样不会出现"孩子复活了、父级还没回来"而被当成孤儿挂到顶层。
+    // 位置一律按当前存活同级重新夹在删前两邻居之间，不能直接写回旧 pos：
+    // 删除期间别人可能已占用同一分数槽。
     const oldParent = batch.parent_id ? getNode(db, batch.parent_id) : null;
-    const parentAlive = !!oldParent && !oldParent.deleted && !idSet.has(oldParent.id);
-    const rootParentId = parentAlive ? batch.parent_id : null;
-    if (!parentAlive) {
-      const pos = midpoint(lastSiblingPos(db, batch.doc_id, null), null);
-      db.prepare('UPDATE nodes SET parent_id = NULL, pos = ? WHERE id = ?').run(pos, batch.root_id);
+    const waitingForParent =
+      !!batch.parent_id && (!oldParent || oldParent.deleted || idSet.has(oldParent.id));
+    let restoredParentId;
+    let restoredPos;
+    if (waitingForParent) {
+      restoredParentId = batch.parent_id;
+      restoredPos = batch.pos;
+    } else if (!batch.parent_id) {
+      restoredParentId = null;
+      restoredPos = posBackBetween(db, batch.doc_id, null, batch.pos);
+      db.prepare('UPDATE nodes SET parent_id = NULL, pos = ? WHERE id = ?').run(restoredPos, batch.root_id);
     } else {
+      restoredParentId = oldParent.id;
+      restoredPos = posBackBetween(db, batch.doc_id, oldParent.id, batch.pos);
       db.prepare('UPDATE nodes SET parent_id = ?, pos = ? WHERE id = ?')
-        .run(batch.parent_id, batch.pos, batch.root_id);
+        .run(restoredParentId, restoredPos, batch.root_id);
     }
     const restoredRoot = getNode(db, batch.root_id);
 
-    // 整棵子树一起复活（普通行；这批里不会有跟读/摘录挂载行）
-    const markAlive = db.prepare('UPDATE nodes SET deleted = 0 WHERE id = ?');
-    for (const id of ids) {
-      if (nodesById.has(id)) markAlive.run(id);
+    // 整棵子树一起复活（普通行；这批里不会有跟读/摘录挂载行）。
+    // 父级还没回来的"挂起批"保持 deleted：父级那批回来时，会把同 doc 下所有
+    // 等待它的挂起批连同自己的子树一并复活（见 restorePendingChildren）。
+    let extraIds = [];
+    if (!waitingForParent) {
+      const markAlive = db.prepare('UPDATE nodes SET deleted = 0 WHERE id = ?');
+      for (const id of ids) {
+        if (nodesById.has(id)) markAlive.run(id);
+      }
+      extraIds = restorePendingChildren(db, batch.doc_id, new Set([batch.root_id, ...ids]));
     }
 
     // CAS：只有仍 active 的这批能被标成已捞回。两个几乎同时到达的捞回在事务
@@ -1788,24 +1842,33 @@ function restoreTrash(db, { trashId, treeRev, userId = '', userName = '' }) {
     const info = db
       .prepare(
         `UPDATE trash_events
-           SET active = 0, restored_at = ?, restored_by_id = ?, restored_by = ?
+           SET active = 0, pending = ?, restored_at = ?, restored_by_id = ?, restored_by = ?
          WHERE id = ? AND active = 1`,
       )
-      .run(now, userId, userName, trashId);
+      .run(waitingForParent ? 1 : 0, now, userId, userName, trashId);
     if (info.changes === 0) {
       throw new Error('restore CAS lost'); // 事务回滚，由后到者重读 active=0 走 already
     }
 
-    // 顺手把同文档里"root 已不在名单（父级先一步复活）"等异常情况留给重放：
-    // 结构事件本身足以重建，这里只追加时间轴。
+    if (waitingForParent) {
+      // 挂起：不写 restore 时间轴、不推进 tree_rev——树此刻没有可见变化；
+      // 等父级批回来时由级联补一条 restore（那一刻全员才看到这段回来）。
+      return {
+        status: 'waiting',
+        ids,
+        rootId: batch.root_id,
+        parentId: batch.parent_id,
+        treeRev: getDoc(db, batch.doc_id).tree_rev,
+      };
+    }
+
+    const allIds = [...new Set([...ids, ...extraIds])];
     logEvent(db, {
       docId: batch.doc_id, kind: 'restore', nodeId: batch.root_id,
       parentId: restoredRoot.parent_id, pos: restoredRoot.pos,
-      deletedIds: ids,
+      deletedIds: allIds,
       author: userName, authorId: userId,
-      note: parentAlive
-        ? `捞回删除的段落（含子树共 ${ids.length} 段，放回原位）`
-        : `捞回删除的段落（含子树共 ${ids.length} 段，原父级已不在，放到顶层）`,
+      note: `捞回删除的段落（含子树共 ${allIds.length} 段，放回删前的邻居之间）`,
       at: now,
     });
     bumpTreeRev(db, batch.doc_id, now);
@@ -1814,13 +1877,48 @@ function restoreTrash(db, { trashId, treeRev, userId = '', userName = '' }) {
     return {
       status: 'restored',
       trash: normalizeTrashEvent(db.prepare('SELECT * FROM trash_events WHERE id = ?').get(trashId)),
-      ids,
+      ids: allIds,
       rootId: batch.root_id,
       parentId: restoredRoot.parent_id,
       pos: restoredRoot.pos,
       treeRev: treeRevNow,
     };
   })();
+}
+
+// 父级批复活后级联：把同文档里 pending=1、root 落在刚复活节点集合内的挂起批
+// 一并复活（含多代）；每个挂起批的 root 同样按"删前邻居之间"重新定位。
+// 返回全部被连带复活的节点 id。
+function restorePendingChildren(db, docId, aliveRoots) {
+  const extraIds = [];
+  const aliveIds = new Set(aliveRoots);
+  const pendingRows = db
+    .prepare('SELECT * FROM trash_events WHERE doc_id = ? AND active = 0 AND pending = 1 ORDER BY id')
+    .all(docId);
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const row of pendingRows) {
+      if (!row.pending) continue;
+      const parentNow = row.parent_id ? getNode(db, row.parent_id) : null;
+      const parentOk = !row.parent_id || (parentNow && !parentNow.deleted && aliveIds.has(parentNow.id));
+      if (!parentOk) continue;
+      let pids;
+      try { pids = JSON.parse(row.ids || '[]'); } catch { pids = []; }
+      const newPos = row.parent_id
+        ? posBackBetween(db, docId, row.parent_id, row.pos)
+        : posBackBetween(db, docId, null, row.pos);
+      db.prepare('UPDATE nodes SET parent_id = ?, pos = ? WHERE id = ?')
+        .run(row.parent_id, newPos, row.root_id);
+      const markAlive = db.prepare('UPDATE nodes SET deleted = 0 WHERE id = ?');
+      for (const id of pids) markAlive.run(id);
+      db.prepare('UPDATE trash_events SET pending = 0 WHERE id = ?').run(row.id);
+      for (const id of pids) { extraIds.push(id); aliveIds.add(id); }
+      row.pending = 0;
+      progressed = true;
+    }
+  }
+  return extraIds;
 }
 
 module.exports = {
