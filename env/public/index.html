@@ -28,6 +28,7 @@
       <div class="top-actions">
         <span id="editing-hint" class="editing-hint hidden"></span>
         <button id="publish-btn" class="publish-chip none" title="把当前工作稿定成对外版本">📢 定稿</button>
+        <button id="trash-btn" class="ghost trash-btn" title="被拿掉、可以捞回来的段落（全员同一份名单）">♻ 捞回 <span id="trash-count" class="trash-count hidden">0</span></button>
         <button id="timeline-btn" class="ghost" title="按时刻回看整份大纲">🕘 时间轴</button>
         <div id="users" class="users"></div>
       </div>
@@ -84,6 +85,39 @@
     </div>
     <div id="timeline-list" class="history-list"></div>
   </aside>
+
+  <!-- 可捞名单抽屉：被拿掉的段落，全房间共享同一份 -->
+  <aside id="trash-panel" class="history-panel trash-panel hidden">
+    <div class="history-head">
+      <strong>捞回拿掉的段落</strong>
+      <button id="trash-close" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div class="history-meta muted">
+      <span>这里列着这份大纲里被拿掉、还可以捞回来的段落——所有正在看这份大纲的人看到的是<b>同一份名单</b>，不只是谁自己的屏幕。捞回后整段（含子段、原文、留言与挂跟读处）一起回到拿掉前的位置。</span>
+    </div>
+    <div id="trash-list" class="history-list"></div>
+  </aside>
+
+  <!-- 捞回确认弹窗：不点确认绝不发 restore，反悔零成本（树仍是上一份拿掉的样子） -->
+  <div id="restore-mask" class="conflict-mask hidden">
+    <div class="newdoc-card">
+      <h3>把这一批捞回树上？</h3>
+      <p class="muted">
+        确认后整段连同它的子段、原文一起回到<b>拿掉前的位置</b>，所有正在看这份大纲的人
+        （含挂着这一段<b>跟读</b>的其它大纲）立刻看到同一份结果；以前挂出去跟着读的地方也一起回来。
+        若你确认期间已被别人先捞回，弹窗会自动关闭并显示<b>先捞者放回的位置</b>——不会两边都显示捞回、位置却对不上。
+        取消或关掉窗口什么都不会发生，树上仍是上一份已拿掉的样子。
+      </p>
+      <div id="restore-meta" class="muted" style="margin:4px 0 8px"></div>
+      <label class="final-label">拿掉前的原文
+        <textarea id="restore-quote" rows="8" readonly></textarea>
+      </label>
+      <div class="conflict-actions">
+        <button type="button" id="restore-cancel" class="ghost">取消（保持拿掉）</button>
+        <button type="button" id="restore-confirm-btn" class="primary">确认捞回</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 新建大纲弹窗 -->
   <div id="newdoc-mask" class="conflict-mask hidden">

@@ -385,6 +385,7 @@ const state = {
   usersByDoc: new Map(), // docId -> Map(userId -> user)
   proposals: new Map(),  // sourceId -> Map(suggestionId -> suggestion)
   commentsByDoc: new Map(), // docId -> Map(commentId -> comment)
+  trashByDoc: new Map(),   // docId -> Map(trashId -> trash item)：全员共享的可捞名单
   historyNodeId: null,
   pendingFocus: null,    // { docId, nodeId, edit?:bool }，快照到达后滚动/进入编辑
   pendingNewDocId: null, // create_doc 后等待快照自动打开的文档
@@ -1069,6 +1070,18 @@ function handleMessage(msg) {
     case 'nodes_deleted':
       applyDeleted(msg);
       break;
+    case 'trash_update':
+      applyTrashUpdate(msg);
+      break;
+    case 'nodes_restored':
+      applyRestored(msg);
+      break;
+    case 'source_restored':
+      applySourceRestored(msg);
+      break;
+    case 'restore_stale':
+      onRestoreStale(msg);
+      break;
     case 'source_deleted':
       applySourceDeleted(msg);
       break;
@@ -1285,6 +1298,9 @@ function ingestSnapshot(msg) {
   }
   // 留言按文档整份随快照下发（讨论量小，一份文档一条房间消息即可）
   state.commentsByDoc.set(docId, new Map((msg.comments || []).map((c) => [c.id, c])));
+  // 可捞名单整份随快照下发；之后由 trash_update 增量替换，全员同一份
+  state.trashByDoc.set(docId, new Map((msg.trash || []).map((t) => [t.id, t])));
+  renderTrashCount();
 
   // 封口：以这份快照可见的源段落为准重建映射；快照里没下发的源保持不变
   // （另一份文档的快照不会把它删掉），但本快照可见、当前已打开的段若不在 seals 里，
@@ -1516,6 +1532,209 @@ function applySourceDeleted(msg) {
   }
 }
 
+/* ================= 捞回拿掉的段落（回收站）：全员共享名单 + 批次 CAS =================
+ *
+ * 名单在服务器（snapshot.trash / trash_update 广播）：所有正在看这份大纲的人
+ * （含自己的其他标签页）看到同一份可捞记录，不做本地乐观增删。
+ * - 删除一个普通段落（含子树）：同一批进名单，整批一起回来；跟读/摘录的摘除
+ *   只是移除引用，源还在，不进名单。
+ * - 捞回走结构乐观锁 + 批次 CAS：两人几乎同时捞同一批，只有先到者那条
+ *   nodes_restored 被广播；后到者收 restore_stale（随整份快照纠正），收敛到
+ *   先捞者放回的位置，不可能"两边都显示捞回来了、位置却对不上"。
+ * - 跟读宿主收 source_restored：墓碑撤除，重新投影源正文；摘录宿主只收
+ *   "源回来了"，冻字不自动换，仍需显式对齐。
+ * - 只有确认弹窗点「确认捞回」才发 restore；取消/遮罩零请求，树保持拿掉的样子。
+ */
+function trashMap(docId) {
+  if (!state.trashByDoc.has(docId)) state.trashByDoc.set(docId, new Map());
+  return state.trashByDoc.get(docId);
+}
+
+function trashList(docId = state.activeDocId) {
+  const map = state.trashByDoc.get(docId);
+  return map ? [...map.values()].sort((a, b) => b.id - a.id) : [];
+}
+
+function applyTrashUpdate(msg) {
+  state.trashByDoc.set(msg.docId, new Map((msg.trash || []).map((t) => [t.id, t])));
+  renderTrashCount();
+  if (msg.docId === state.activeDocId && !$('#trash-panel').classList.contains('hidden')) {
+    fillTrashPanel();
+  }
+}
+
+// 一批捞回成功（房间里唯一一条事实，含发起者的其他标签页）：把复活的整棵
+// 子树插回本地视图，位置/原文以消息里的快照为准；名单同步移除这批。
+function applyRestored(msg) {
+  const view = viewOf(msg.docId);
+  if (view) {
+    view.treeRev = msg.treeRev;
+    for (const node of msg.nodes || []) view.nodes.set(node.id, node);
+    reindex(view);
+    if (msg.docId === state.activeDocId) {
+      renderOutline();
+      requestAnimationFrame(() => {
+        scrollToRow(msg.rootId);
+        flashRow(msg.docId, msg.rootId, 2000);
+      });
+    }
+  }
+  if (msg.trash) applyTrashUpdate({ docId: msg.docId, trash: msg.trash });
+  // 留言锚定段落：删除期间挂在这些段上的留言随复活行一起回来
+  for (const comment of msg.comments || []) upsertComment(comment);
+  if (restoreDialog.trashId === msg.trashId) closeRestoreMask();
+  if (msg.by?.userId !== state.me?.userId) {
+    toast(`${msg.by?.userName || '有人'} 捞回了 ${msg.ids.length} 段（含子段），已回到拿掉前的位置`, 'ok', 4200);
+  }
+}
+
+// 源段落（在别的文档里）被捞回：本文档的跟读墓碑撤除、重新投影原文；
+// 摘录只解除"源已删除"墓碑并刷新源当前版本，冻字保持不动（要更新仍需显式对齐）。
+function applySourceRestored(msg) {
+  const bySource = new Map((msg.contents || []).map((c) => [c.nodeId, c]));
+  const versions = new Map((msg.sourceVersions || []).map((v) => [v.nodeId, v.version]));
+  for (const sourceId of msg.sourceIds || []) {
+    for (const { view, node } of rowsOfSource(sourceId)) {
+      const c = bySource.get(sourceId);
+      if (c) {
+        node.sourceDeleted = 0;
+        node.version = c.version;
+        node.content = c.content;
+        node.author = c.author;
+        node.authorId = c.authorId;
+        node.updatedAt = c.updatedAt;
+      } else {
+        // 内容不在本消息里（引用行已无）：墓碑至少撤除，
+        // 精确内容等该文档的快照/正文消息补齐。
+        node.sourceDeleted = 0;
+      }
+      patchRow(view, node.id);
+    }
+    for (const { view, node } of excerptRowsOfSource(sourceId)) {
+      node.sourceDeleted = 0;
+      if (versions.has(sourceId)) {
+        node.currentSourceVersion = versions.get(sourceId);
+        node.stale = versions.get(sourceId) !== node.sourceVersion ? 1 : 0;
+      }
+      patchRow(view, node.id);
+    }
+  }
+}
+
+// 并发捞回输了 / 确认期间树被改过：服务器随 tree_stale + snapshot 已纠正，
+// 这里关掉弹窗并刷新名单，事实（先捞者的位置）以快照为准。
+function onRestoreStale(msg) {
+  $('#restore-confirm-btn')?.classList.remove('busy');
+  if (restoreDialog.trashId === msg.trashId) closeRestoreMask();
+  if (msg.reason !== 'tree') fillTrashPanel();
+  toast(msg.message || '这批刚被别人捞回，已为你显示同一份树和名单', 'error', 5200);
+}
+
+function renderTrashCount() {
+  const count = trashList().length;
+  const el = $('#trash-count');
+  if (!el) return;
+  el.textContent = String(count);
+  el.classList.toggle('hidden', count === 0);
+  $('#trash-btn').classList.toggle('hidden', !!timeTravel.active);
+}
+
+/* ================= 可捞名单抽屉与捞回确认弹窗 ================= */
+
+const restoreDialog = { trashId: null };
+
+$('#trash-btn').addEventListener('click', () => {
+  if (!state.activeDocId) return;
+  if (timeTravel.active) {
+    toast('回看历史时刻时不能捞回；先点「回到现在」', 'error');
+    return;
+  }
+  const p = currentPresentation();
+  if (p && !amPresentationLeader()) {
+    toast(`${p.leader.userName} 正在讲，跟读中不能捞回；等 TA 交棒后再操作`, 'error', 4200);
+    followPresentation({ force: true });
+    return;
+  }
+  if (!viewOf(state.activeDocId)) return;
+  $('#trash-panel').classList.remove('hidden');
+  fillTrashPanel();
+});
+$('#trash-close').addEventListener('click', () => $('#trash-panel').classList.add('hidden'));
+
+function fillTrashPanel() {
+  const list = $('#trash-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const items = trashList(state.activeDocId);
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted comment-empty';
+    empty.textContent = '没有可捞回的段落。删除普通段落（含子树）后会出现在这里，全员都看得见、都可以捞。';
+    list.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement('div');
+    card.className = 'rev-card trash-card';
+    card.innerHTML = `
+      <div class="rev-head">
+        <span><strong class="trash-preview"></strong></span>
+        <span class="muted">${fmtTime(item.createdAt)}</span>
+      </div>
+      <div class="rev-content"></div>
+      <div class="rev-note"></div>
+      <div class="rev-actions">
+        <button class="restore-trash-btn">♻ 捞回这一批（${item.count} 段）</button>
+      </div>`;
+    card.querySelector('.trash-preview').textContent = item.preview || '（空段落）';
+    card.querySelector('.rev-content').textContent = item.preview || '（空段落）';
+    card.querySelector('.rev-note').textContent =
+      `${item.count} 段（含子段）· ${item.author || '成员'} 拿掉` +
+      (item.parentId ? ' · 原位：拿掉时的父级之下' : ' · 原位：顶层');
+    card.querySelector('.restore-trash-btn').addEventListener('click', () => openRestoreMask(item));
+    list.appendChild(card);
+  }
+}
+
+// 打开捞回确认弹窗：只有点「确认捞回」才发 restore。完整删前原文随名单
+// 下发（item.content）；节点本体的最终位置/原文以捞回广播里的快照为准。
+function openRestoreMask(item) {
+  if (!requireOnline()) return;
+  if (!requirePresenterForEdit()) return;
+  restoreDialog.trashId = item.id;
+  restoreDialog.treeRev = viewOf(state.activeDocId)?.treeRev;
+  $('#restore-meta').textContent =
+    `这批共 ${item.count} 段，${item.author || '成员'} 于 ${fmtTime(item.createdAt)} 拿掉。` +
+    (item.parentId ? '捞回后放回拿掉时的父级之下；' : '捞回后放回顶层；') +
+    '若原父级已不在，会放到顶层末尾。';
+  // 完整删前原文随名单下发（trash.content）；老消息里没有时退回摘要
+  $('#restore-quote').value = typeof item.content === 'string' ? item.content : (item.preview || '（空段落）');
+  $('#restore-mask').classList.remove('hidden');
+}
+
+function closeRestoreMask() {
+  $('#restore-mask').classList.add('hidden');
+  $('#restore-confirm-btn')?.classList.remove('busy');
+  restoreDialog.trashId = null;
+}
+
+$('#restore-cancel').addEventListener('click', closeRestoreMask);
+$('#restore-mask').addEventListener('click', (e) => {
+  if (e.target === $('#restore-mask')) closeRestoreMask();
+});
+$('#restore-confirm-btn').addEventListener('click', () => {
+  const trashId = restoreDialog.trashId;
+  if (!trashId) return;
+  if (!requireOnline()) return;
+  const view = viewOf(state.activeDocId);
+  if (!view) return;
+  $('#restore-confirm-btn').classList.add('busy');
+  // 反悔只发生在点确认之前：到这里才发 restore。treeRev + 批次 CAS 双保险。
+  send({ type: 'restore', trashId, treeRev: view.treeRev });
+  // 兜底：结果由 nodes_restored / restore_stale 关窗；4 秒无响应解除忙碌态
+  setTimeout(() => $('#restore-confirm-btn')?.classList.remove('busy'), 4000);
+});
+
 /* ================= 摘录（excerpt）：冻一份字，显式对齐，CAS 防并发 =================
  *
  * 摘录与跟读相反：正文在摘录那一刻复制冻结到 node 自己身上（node.content），
@@ -1695,6 +1914,7 @@ function renderActiveDoc() {
   renderTimeBanner();
   renderSyncState();
   renderPresentBanner();
+  renderTrashCount();
   $('#add-root').disabled = !state.activeDocId || timeTravel.active ||
     (!!currentPresentation() && !amPresentationLeader());
   updateEditingHint();
@@ -3161,9 +3381,9 @@ function deleteNode(nodeId) {
   }
   const mirrorCount = countMirrors(nodeId);
   const extra = mirrorCount
-    ? `\n\n注意：有 ${mirrorCount} 处跟读挂着这段，删除后它们会显示「源段落已被删除」。`
+    ? `\n\n注意：有 ${mirrorCount} 处跟读挂着这段，删除后它们会显示「源段落已被删除」；捞回这段后跟读处也会一起恢复。`
     : '';
-  if (!confirm('确定删除该段落及其所有子段落？（历史仍保留，但视图中会移除）' + extra)) return;
+  if (!confirm('确定删除该段落及其所有子段落？删除后全员可见地进入「♻ 捞回」名单，随时可以连原文带位置一起捞回来。' + extra)) return;
   send({ type: 'delete', nodeId, treeRev: found.view.treeRev });
   if (edit.sourceId === nodeId) stopEditing();
 }
@@ -3600,7 +3820,7 @@ $('#timeline-close').addEventListener('click', () => {
 $('#tt-exit').addEventListener('click', exitTimeTravel);
 
 const TL_KIND_LABEL = {
-  add: '新增', content: '修改', move: '移动', delete: '删除',
+  add: '新增', content: '修改', move: '移动', delete: '删除', restore: '捞回',
   mirror_add: '跟读', excerpt_add: '摘录', excerpt_align: '摘录对齐',
   seal: '封口', unseal: '打开',
 };

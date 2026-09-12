@@ -230,6 +230,7 @@ function snapshotMessage(docId) {
     suggestions: relevantSuggestions(snap.nodes),
     comments: store.listCommentsForDoc(db, docId),
     seals: snap.seals || [],
+    trash: store.listTrash(db, docId, true),
     users: presenceList(docId),
     published: pub
       ? {
@@ -1827,6 +1828,11 @@ function handleDelete(peer, msg) {
   sendToDoc(doc.id, {
     type: 'nodes_deleted', docId: doc.id, ids: result.ids, treeRev: result.treeRev,
   });
+  // 可捞名单同房间共享：所有正在看这份的人（含发起者的其他标签页）立刻看到
+  // 同一批进了名单，不是只有删除者屏幕上有。
+  if (result.trash) {
+    sendToDoc(doc.id, { type: 'trash_update', docId: doc.id, trash: store.listTrash(db, doc.id, true) });
+  }
 
   // 挂在别的大纲（含同一份大纲别处）里的跟读：不删行、不显示旧正文，
   // 转为"源已删除"墓碑。源行本身已由上面的 nodes_deleted 移除，
@@ -1850,6 +1856,143 @@ function handleDelete(peer, msg) {
         '段落已删除',
       );
     }
+  }
+}
+
+// ---------- 捞回删除的段落（整棵子树）：结构乐观锁 + 批次 CAS ----------
+//
+// 关键语义（与定稿/封口/留言收掉同一套收敛思路）：
+// - 可捞名单是服务器事实（snapshot.trash / trash_update 广播）：所有正在看
+//   这份大纲的人看到同一份，不存在"只在自己屏幕上"。
+// - 捞回在单个 SQLite 事务里复活整棵子树、写 restore 时间轴、把该批 active
+//   条件置 0（WHERE active=1），并广播唯一一条 nodes_restored（含原文快照，
+//   客户端不必再拉整树）。跟读宿主/摘录宿主收到 source_restored：墓碑撤除，
+//   跟读重新投影、摘录重新可以对齐。
+// - 两人几乎同时捞同一批：Node 单线程 + SQLite 事务天然串行。tree_rev 先过期
+//   的那个收 tree_stale（随整份快照纠正）；tree_rev 相同的第二个在事务里读到
+//   active=0，只收到 restore_stale + 先捞者放回的新位置，房间不会有第二条
+//   nodes_restored——不可能两边都显示捞回来、位置却对不上。
+// - 只有点确认弹窗的「确认捞回」才发 restore；打开弹窗/取消/遮罩零写入，
+//   树仍是上一份"已拿掉"的样子。
+function handleRestoreNode(peer, msg) {
+  if (peer.role === 'viewer') {
+    send(peer, { type: 'error', message: '对外定稿页是只读的' });
+    return;
+  }
+  const trashId = Number(msg.trashId);
+  if (!Number.isInteger(trashId) || trashId < 1) {
+    send(peer, { type: 'error', message: '缺少要捞回的名单条目' });
+    return;
+  }
+  const batch = store.getTrashEvent(db, trashId);
+  if (!batch) {
+    send(peer, { type: 'error', message: '这条可捞记录不存在' });
+    return;
+  }
+  if (!denyWriteWhileFollowing(peer, batch.docId, { nodeId: batch.rootId })) return;
+
+  const result = store.restoreTrash(db, {
+    trashId,
+    treeRev: Number(msg.treeRev),
+    userId: peer.user.userId,
+    userName: peer.user.userName,
+  });
+  if (result.status === 'missing') {
+    send(peer, { type: 'error', message: '这条可捞记录不存在' });
+    return;
+  }
+  if (result.status === 'stale_tree') {
+    const doc = store.getDoc(db, batch.docId);
+    sendStale(peer, doc);
+    // 树版本过期 + 名单可能也变了：快照里带最新名单，这里再补一条更明确的提示
+    send(peer, {
+      type: 'restore_stale',
+      docId: batch.docId,
+      trashId,
+      reason: 'tree',
+      message: '你确认期间树刚被别人改过，已刷新；请在最新名单里确认后再捞',
+    });
+    return;
+  }
+  if (result.status === 'already') {
+    // 并发输了：绝不广播第二条 nodes_restored。把先捞者的结果带给后来者，
+    // 他的界面（名单与树）收敛到全员同一份。
+    send(peer, { type: 'tree_stale', docId: batch.docId, treeRev: result.treeRev });
+    send(peer, snapshotMessage(batch.docId));
+    send(peer, {
+      type: 'restore_stale',
+      docId: batch.docId,
+      trashId,
+      rootId: result.rootId,
+      reason: 'already',
+      message: '这批刚被另一位成员捞回，已为你显示同一份树和名单（不会两边各捞一份）',
+    });
+    return;
+  }
+
+  const docId = result.trash.docId;
+  // 复活行的当前快照（含正文/版本/封口），随广播一次性下发：
+  // 所有观看者立刻看到"回到拿掉前的位置和原文"，不用等整树快照。
+  const snap = store.getSnapshot(db, docId);
+  const nodes = result.ids
+    .map((id) => snap.nodes.find((n) => n.id === id))
+    .filter(Boolean);
+  // 留言锚定段落、删除期间也在：复活行挂着的留言一并带回（客户端 upsert）
+  const comments = store.listCommentsForDoc(db, docId)
+    .filter((c) => result.ids.includes(c.nodeId));
+
+  sendToDoc(docId, {
+    type: 'nodes_restored',
+    docId,
+    trashId,
+    ids: result.ids,
+    rootId: result.rootId,
+    parentId: result.parentId,
+    pos: result.pos,
+    nodes,
+    comments,
+    treeRev: result.treeRev,
+    trash: store.listTrash(db, docId, true),
+    by: { userId: peer.user.userId, userName: peer.user.userName },
+  });
+
+  // 跨文档的跟读/摘录：源回来了，墓碑撤除。跟读宿主顺便带上各源当前正文，
+  // 它们重新投影；摘录只收"源回来了 + 当前版本"，冻字一个字都不自动换。
+  // 只通知此刻还挂着这棵子树引用的宿主（引用行已被单独移除的不受影响）。
+  const mirrorDocs = store.mirrorHostDocs(db, result.ids).filter((d) => d !== docId);
+  const excerptDocs = store.excerptHostDocs(db, result.ids).filter((d) => d !== docId);
+  const hosts = new Set([...mirrorDocs, ...excerptDocs]);
+  const latestById = new Map(
+    result.ids.map((id) => [id, store.getLatestRevision(db, id)]).filter(([, r]) => r),
+  );
+  for (const hostDocId of hosts) {
+    let contents = [];
+    if (mirrorDocs.includes(hostDocId)) {
+      const liveMirrorSources = new Set(
+        db
+          .prepare('SELECT DISTINCT mirror_of AS id FROM nodes WHERE doc_id = ? AND deleted = 0')
+          .all(hostDocId)
+          .map((r) => r.id),
+      );
+      contents = result.ids
+        .filter((id) => liveMirrorSources.has(id))
+        .map((id) => latestById.get(id))
+        .filter(Boolean)
+        .map((r) => ({
+          nodeId: r.node_id, version: r.version, content: r.content,
+          author: r.author, authorId: r.author_id, updatedAt: r.created_at,
+        }));
+    }
+    sendToDoc(hostDocId, {
+      type: 'source_restored',
+      sourceIds: result.ids,
+      // 每个复活源的当前版本：摘录行据此重算「原文已改到 v几」徽章
+      sourceVersions: result.ids
+        .filter((id) => latestById.has(id))
+        .map((id) => ({ nodeId: id, version: latestById.get(id).version })),
+      contents,
+      treeRev: result.treeRev,
+    });
   }
 }
 
@@ -1917,6 +2060,7 @@ wss.on('connection', (ws) => {
         case 'add': handleAdd(peer, msg); break;
         case 'move': handleMove(peer, msg); break;
         case 'delete': handleDelete(peer, msg); break;
+        case 'restore': handleRestoreNode(peer, msg); break;
         default: send(peer, { type: 'error', message: `未知消息类型: ${msg.type}` });
       }
     } catch (err) {

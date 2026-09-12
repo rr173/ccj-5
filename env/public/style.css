@@ -620,3 +620,17 @@ button.danger-text { color: var(--danger); }
   border-radius: 8px; padding: 10px 12px;
 }
 .publish-current b { color: #0f766e; }
+
+/* 可捞名单（回收站） */
+.trash-btn { position: relative; }
+.trash-count {
+  display: inline-block; min-width: 18px; margin-left: 4px; padding: 0 5px;
+  border-radius: 9px; background: var(--warn); color: #fff;
+  font-size: 12px; line-height: 18px; text-align: center;
+}
+.trash-panel { width: 420px; }
+.trash-card .restore-trash-btn {
+  color: var(--ok); border-color: #b6e0d0;
+}
+.trash-card .restore-trash-btn:hover { background: #f0faf6; }
+.trash-card .trash-preview { color: var(--text); }

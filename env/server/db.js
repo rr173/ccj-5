@@ -3,6 +3,7 @@
 const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
+const { midpoint } = require('./fraction');
 
 const DEFAULT_DOC = 'default';
 
@@ -171,6 +172,33 @@ function init(dbFile) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_seal_node ON seal_events(node_id, id);
+
+    -- 可捞名单（回收站）：删除一个普通段落（含整棵子树）时，在同事务追加一批。
+    -- "谁还能捞"由这张表唯一决定：删除后广播同一份给整个文档房间（含发起者的
+    -- 其他标签页），晚加入者从 snapshot.trash 整份拿到——不是谁自己屏幕上的临时状态。
+    -- 一批 = 一次删除（root_id 是被删的起点）；整棵子树随 root 一起回来，不逐段捞。
+    -- 捞回（restore）时按 id 的 CAS 在同一事务串行：先到者把整批 deleted=0、
+    -- 追加一条 restore 时间轴；后到者事务里读到 active=0，只拿到 already + 先捞者
+    -- 那份事实（节点新位置），房间里绝不会有两条 nodes_restored，不可能
+    -- "两边都显示捞回来了、位置/内容却对不上"。
+    CREATE TABLE IF NOT EXISTS trash_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id      TEXT NOT NULL,         -- 这批归属的文档房间（决定名单广播范围）
+      root_id     TEXT NOT NULL,         -- 被删起点（捞回只认 root，子树随它一起）
+      ids         TEXT NOT NULL,         -- JSON 数组：整棵子树（删除时的全部 id）
+      parent_id   TEXT,                  -- 删掉前 root 的父级（顶层为 NULL）
+      pos         TEXT NOT NULL DEFAULT '', -- 删掉前 root 的同级位置
+      preview     TEXT NOT NULL DEFAULT '', -- root 删前正文摘要（名单里展示用）
+      count       INTEGER NOT NULL DEFAULT 1, -- 这批共多少段（含子树）
+      active      INTEGER NOT NULL DEFAULT 1, -- 1=在名单里可捞；0=已捞回（留痕）
+      author_id   TEXT NOT NULL DEFAULT '',
+      author      TEXT NOT NULL DEFAULT '',
+      created_at  INTEGER NOT NULL,
+      restored_at INTEGER,
+      restored_by_id TEXT,
+      restored_by    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_trash_doc ON trash_events(doc_id, active, id);
   `);
 
   // 旧库迁移：补 mirror_of / excerpt_of 列（必须先于该列的索引创建）
@@ -197,8 +225,60 @@ function init(dbFile) {
   }
 
   backfillTimeline(db);
+  backfillTrash(db);
   seedIfEmpty(db);
   return db;
+}
+
+// 旧库升级：当前仍处于删除状态的普通段落补进可捞名单。
+// 一次 delete 事件对应一批（deleted_ids）；只补"这批现在整体仍删着"的批次，
+// 已捞回/已不在的不补。跟读/摘录的摘除（kind=delete 但行是引用行）不进名单。
+function backfillTrash(db) {
+  const hasTrash = db.prepare('SELECT COUNT(*) AS c FROM trash_events').get().c > 0;
+  if (hasTrash) return;
+  const deletedRows = db
+    .prepare(
+      `SELECT t.*, r.content AS revContent
+       FROM timeline t
+       LEFT JOIN revisions r ON r.id = t.rev_id
+       WHERE t.kind = 'delete'
+       ORDER BY t.seq`,
+    )
+    .all();
+  if (!deletedRows.length) return;
+  const now = Date.now();
+  const ins = db.prepare(
+    `INSERT INTO trash_events
+       (doc_id, root_id, ids, parent_id, pos, preview, count, active,
+        author_id, author, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+  );
+  const nodeStmt = db.prepare('SELECT * FROM nodes WHERE id = ?');
+  const revStmt = db.prepare(
+    'SELECT content FROM revisions WHERE node_id = ? ORDER BY version DESC LIMIT 1',
+  );
+  const tx = db.transaction(() => {
+    for (const e of deletedRows) {
+      let ids;
+      try { ids = JSON.parse(e.deleted_ids || '[]'); } catch { ids = []; }
+      if (!ids.length) continue;
+      const root = nodeStmt.get(e.node_id);
+      if (!root || root.mirror_of || root.excerpt_of) continue; // 引用行摘除不可捞
+      // 这批整体仍删着才补（root 活着说明它已被历史手段恢复过）
+      const allStillDeleted = ids.every((id) => {
+        const n = nodeStmt.get(id);
+        return n && n.deleted;
+      });
+      if (!allStillDeleted) continue;
+      const rev = revStmt.get(e.node_id);
+      ins.run(
+        e.doc_id, e.node_id, JSON.stringify(ids),
+        root.parent_id, root.pos, clip(rev ? rev.content : '', 80), ids.length,
+        e.author_id || '', e.author || '系统', e.created_at || now,
+      );
+    }
+  });
+  tx();
 }
 
 // 旧库（没有 timeline 的时代）升级：按 created_at 尽力重放一条时间轴。
@@ -980,10 +1060,31 @@ function deleteNode(db, { nodeId, treeRev, userId = '', userName = '' }) {
         : node.excerpt_of ? '移除摘录'
         : `删除段落（含子树共 ${ids.length} 段）`,
     });
+
+    // 普通段落（含子树）进可捞名单；跟读/摘录只是摘除一处引用，源还在，不用捞。
+    let trash = null;
+    if (!node.mirror_of && !node.excerpt_of) {
+      const rootRev = getLatestRevision(db, nodeId);
+      const info = db
+        .prepare(
+          `INSERT INTO trash_events
+             (doc_id, root_id, ids, parent_id, pos, preview, count, active,
+              author_id, author, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+        )
+        .run(
+          doc.id, nodeId, JSON.stringify(ids), node.parent_id, node.pos,
+          clip(rootRev ? rootRev.content : '', 80), ids.length,
+          userId, userName, Date.now(),
+        );
+      trash = normalizeTrashEvent(db.prepare('SELECT * FROM trash_events WHERE id = ?').get(info.lastInsertRowid));
+    }
+
     bumpTreeRev(db, doc.id);
     return {
       status: 'deleted',
       ids,
+      trash,
       treeRev: getDoc(db, doc.id).tree_rev,
       kind: node.mirror_of ? 'mirror' : node.excerpt_of ? 'excerpt' : 'node',
       supersededSuggestions: supersededSuggestionIds.map((id) => getSuggestion(db, id)),
@@ -1026,6 +1127,9 @@ function getTimeline(db, limit = 300) {
     else if (r.kind === 'seal') summary = r.note || '封口段落';
     else if (r.kind === 'unseal') summary = r.note || '重新打开段落';
     else if (r.kind === 'move') summary = '移动段落 / 调整层级';
+    else if (r.kind === 'restore') {
+      summary = `捞回删除的段落（共 ${(JSON.parse(r.deletedIds || '[]')).length} 段）`;
+    }
     else if (r.kind === 'delete') {
       summary = `删除段落（共 ${(JSON.parse(r.deletedIds || '[]')).length} 段）`;
     } else summary = r.kind;
@@ -1083,6 +1187,19 @@ function getSnapshotAt(db, docId, seq) {
       if (n && !n.deleted) {
         n.parentId = e.parentId;
         n.pos = e.pos;
+      }
+    } else if (e.kind === 'restore') {
+      // 捞回：整批 id 复活；root 放回事件记下的父级（父级已不在则为顶层）。
+      // 子级内部的 parent/pos 从没被改过，随 root 一起呈现删除前的样子。
+      const root = tree.get(e.nodeId);
+      const ids = JSON.parse(e.deletedIds || '[]');
+      for (const id of ids) {
+        const n = tree.get(id);
+        if (n) n.deleted = 0;
+      }
+      if (root) {
+        root.parentId = e.parentId;
+        root.pos = e.pos;
       }
     } else if (e.kind === 'delete') {
       for (const id of JSON.parse(e.deletedIds || '[]')) {
@@ -1538,6 +1655,174 @@ function sealedIdsWithin(db, ids) {
   return listCurrentSeals(db, ids).map((s) => s.nodeId);
 }
 
+// ---------- 可捞名单（回收站）与捞回 ----------
+//
+// 删除是软删：正文 revisions、留言、封口事件全都在，只是 nodes.deleted=1。
+// 可捞名单由 trash_events 决定（一批 = 一次删除的整棵子树），全房间共享：
+// 删除时广播、快照随带，所有正在看这份大纲的人（含自己的其他标签页）看到
+// 同一份名单，不可能"只在删除者屏幕上"。
+//
+// 捞回是结构操作，走和增/删/移动同一把 tree_rev 乐观锁；除此之外还在同一
+// SQLite 事务里做"这批仍可捞"的 CAS（条件 UPDATE ... WHERE active=1）：
+// 两人几乎同时捞同一批、手里看到的树版本/名单还不一样时，先到者写入并广播
+// 唯一一条 nodes_restored，后到者 changes=0 只拿到 stale + 先捞者那份新位置，
+// 绝不可能"两边都显示捞回来了，位置却对不上"。
+
+function normalizeTrashEvent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    docId: row.doc_id,
+    rootId: row.root_id,
+    ids: (() => {
+      try { return JSON.parse(row.ids || '[]'); } catch { return []; }
+    })(),
+    parentId: row.parent_id ?? null,
+    pos: row.pos || '',
+    preview: row.preview || '',
+    count: row.count || 1,
+    active: row.active ? 1 : 0,
+    authorId: row.author_id,
+    author: row.author,
+    createdAt: row.created_at,
+    restoredAt: row.restored_at || null,
+    restoredBy: row.restored_by || null,
+  };
+}
+
+// 文档当前可捞的名单（按删除先后，最近的在前）。
+// withContent：名单在快照/广播里下发时附上 root 删前完整原文（确认弹窗直接展示，
+// 不必再为每段拉历史）；节点本体的正文以捞回广播里的快照为准。
+function listTrash(db, docId, withContent = false) {
+  const rows = db
+    .prepare('SELECT * FROM trash_events WHERE doc_id = ? AND active = 1 ORDER BY id DESC')
+    .all(docId)
+    .map(normalizeTrashEvent);
+  if (withContent) {
+    for (const t of rows) {
+      const rev = getLatestRevision(db, t.rootId);
+      t.content = rev ? rev.content : '';
+      t.version = rev ? rev.version : 0;
+    }
+  }
+  return rows;
+}
+
+function getTrashEvent(db, id) {
+  const row = db.prepare('SELECT * FROM trash_events WHERE id = ?').get(id);
+  return normalizeTrashEvent(row);
+}
+
+// 同层最后一个存活位置（顶层 parentId=null 用 IS NULL 匹配）
+function lastSiblingPos(db, docId, parentId) {
+  const row = db
+    .prepare(
+      `SELECT pos FROM nodes
+       WHERE doc_id = ? AND deleted = 0 AND parent_id IS ?
+       ORDER BY pos DESC LIMIT 1`,
+    )
+    .get(docId, parentId);
+  return row ? row.pos : null;
+}
+
+// 捞回一批（整棵子树）。
+// 返回：
+//  restored —— 本次请求捞回的（调用方广播唯一一条 nodes_restored）
+//  stale_tree —— tree_rev 过期（随快照纠正）
+//  already   —— 已被别人先捞回（带回先捞者那份新位置；绝不广播第二条）
+//  missing   —— 名单/文档不存在
+function restoreTrash(db, { trashId, treeRev, userId = '', userName = '' }) {
+  return db.transaction(() => {
+    const batch = db.prepare('SELECT * FROM trash_events WHERE id = ?').get(trashId);
+    if (!batch) return { status: 'missing' };
+    const doc = getDoc(db, batch.doc_id);
+    if (!doc) return { status: 'missing' };
+    if (treeRev !== undefined && treeRev !== doc.tree_rev) {
+      return { status: 'stale_tree', treeRev: doc.tree_rev };
+    }
+    if (!batch.active) {
+      // 并发输了：先捞者已把这批放回树上。带回先捞者的结果，界面收敛到同一份。
+      const root = getNode(db, batch.root_id);
+      return {
+        status: 'already',
+        treeRev: doc.tree_rev,
+        rootId: batch.root_id,
+        parentId: root && !root.deleted ? root.parent_id : null,
+        pos: root && !root.deleted ? root.pos : null,
+      };
+    }
+    let ids;
+    try { ids = JSON.parse(batch.ids || '[]'); } catch { ids = []; }
+    const idSet = new Set(ids);
+    const nodesById = new Map(
+      db.prepare('SELECT * FROM nodes WHERE id IN (' + ids.map(() => '?').join(',') + ')')
+        .all(...ids)
+        .map((n) => [n.id, n]),
+    );
+
+    // root 删掉前的父级还在不在：还在就放回原位（整棵子树内部 parent/pos 不动，
+    // 自然呈现"拿掉前的位置和原文"）；父级当时也一起被删（子树删除不会发生），
+    // 或父级此刻在另一批名单里还没捞回，则放到顶层末尾——等父级那批之后被捞回，
+    // 子树仍按 parent 指针重新挂回它下面。
+    const oldParent = batch.parent_id ? getNode(db, batch.parent_id) : null;
+    const parentAlive = !!oldParent && !oldParent.deleted && !idSet.has(oldParent.id);
+    const rootParentId = parentAlive ? batch.parent_id : null;
+    if (!parentAlive) {
+      const pos = midpoint(lastSiblingPos(db, batch.doc_id, null), null);
+      db.prepare('UPDATE nodes SET parent_id = NULL, pos = ? WHERE id = ?').run(pos, batch.root_id);
+    } else {
+      db.prepare('UPDATE nodes SET parent_id = ?, pos = ? WHERE id = ?')
+        .run(batch.parent_id, batch.pos, batch.root_id);
+    }
+    const restoredRoot = getNode(db, batch.root_id);
+
+    // 整棵子树一起复活（普通行；这批里不会有跟读/摘录挂载行）
+    const markAlive = db.prepare('UPDATE nodes SET deleted = 0 WHERE id = ?');
+    for (const id of ids) {
+      if (nodesById.has(id)) markAlive.run(id);
+    }
+
+    // CAS：只有仍 active 的这批能被标成已捞回。两个几乎同时到达的捞回在事务
+    // 队列里串行，后到者 changes=0，只会走 already 分支。
+    const now = Date.now();
+    const info = db
+      .prepare(
+        `UPDATE trash_events
+           SET active = 0, restored_at = ?, restored_by_id = ?, restored_by = ?
+         WHERE id = ? AND active = 1`,
+      )
+      .run(now, userId, userName, trashId);
+    if (info.changes === 0) {
+      throw new Error('restore CAS lost'); // 事务回滚，由后到者重读 active=0 走 already
+    }
+
+    // 顺手把同文档里"root 已不在名单（父级先一步复活）"等异常情况留给重放：
+    // 结构事件本身足以重建，这里只追加时间轴。
+    logEvent(db, {
+      docId: batch.doc_id, kind: 'restore', nodeId: batch.root_id,
+      parentId: restoredRoot.parent_id, pos: restoredRoot.pos,
+      deletedIds: ids,
+      author: userName, authorId: userId,
+      note: parentAlive
+        ? `捞回删除的段落（含子树共 ${ids.length} 段，放回原位）`
+        : `捞回删除的段落（含子树共 ${ids.length} 段，原父级已不在，放到顶层）`,
+      at: now,
+    });
+    bumpTreeRev(db, batch.doc_id, now);
+
+    const treeRevNow = getDoc(db, batch.doc_id).tree_rev;
+    return {
+      status: 'restored',
+      trash: normalizeTrashEvent(db.prepare('SELECT * FROM trash_events WHERE id = ?').get(trashId)),
+      ids,
+      rootId: batch.root_id,
+      parentId: restoredRoot.parent_id,
+      pos: restoredRoot.pos,
+      treeRev: treeRevNow,
+    };
+  })();
+}
+
 module.exports = {
   DEFAULT_DOC,
   init,
@@ -1582,4 +1867,7 @@ module.exports = {
   sealNode,
   unsealNode,
   sealedIdsWithin,
+  listTrash,
+  getTrashEvent,
+  restoreTrash,
 };
